@@ -17,6 +17,8 @@ pub struct CapabilityResult {
 
 #[derive(Debug, Error)]
 pub enum CapabilityError {
+    #[error("capability outcome is unknown; reconcile before retrying: {0}")]
+    OutcomeUnknown(String),
     #[error("capability input is invalid: {0}")]
     InvalidInput(String),
     #[error("capability failed: {0}")]

@@ -7,3 +7,4 @@ pub use workspace_read::{WorkspaceReadCapability, WorkspaceReadOperation, Worksp
 pub use workspace_write::{
     WorkspaceWriteCapability, WorkspaceWriteOperation, WorkspaceWriteRequest,
 };
+pub mod browser;

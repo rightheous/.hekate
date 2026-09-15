@@ -917,6 +917,37 @@ impl Engine {
                 self.projector.record_batch(&events, None, None).await?;
                 Ok(receipt)
             }
+            Err(error @ CapabilityError::OutcomeUnknown(_)) => {
+                operation.status = OperationStatus::Unknown;
+                let receipt = Receipt {
+                    id: ReceiptId::new(),
+                    operation_id,
+                    status: OperationStatus::Unknown,
+                    external_reference: None,
+                    output: serde_json::json!({"error": error.to_string()}),
+                    recorded_at: crate::core::model::now(),
+                };
+                let event = self.event(
+                    self.hekate_id,
+                    EventKind::OperationStateUnknown,
+                    Some(EntityRef::new(EntityKind::Operation, operation.id.uuid())),
+                    &operation,
+                    Some(operation.id.to_string()),
+                    None,
+                )?;
+                let receipt_event = self.event(
+                    self.hekate_id,
+                    EventKind::ReceiptRecorded,
+                    Some(EntityRef::new(EntityKind::Receipt, receipt.id.uuid())),
+                    &receipt,
+                    Some(operation.id.to_string()),
+                    Some(event.event_id),
+                )?;
+                self.projector
+                    .record_batch(&[event, receipt_event], None, None)
+                    .await?;
+                Ok(receipt)
+            }
             Err(error) => {
                 operation.status = OperationStatus::Failed;
                 operation.finished_at = Some(crate::core::model::now());

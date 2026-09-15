@@ -1,3 +1,4 @@
+pub mod browser;
 pub mod local_policy;
 pub mod local_workspace;
 pub mod primary_model;
