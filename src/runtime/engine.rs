@@ -493,6 +493,7 @@ impl Engine {
         intent: &crate::core::ActionIntent,
         input: serde_json::Value,
     ) -> Result<crate::ports::CapabilityResult, EngineError> {
+        ensure_operation_matches(intent, &input)?;
         let decision = self.policy.evaluate(actor_id, intent)?;
         if !decision.allowed {
             return Err(EngineError::PolicyDenied(decision.reason));
@@ -789,7 +790,10 @@ impl Engine {
         };
         if matches!(
             operation.status,
-            OperationStatus::Succeeded | OperationStatus::Verified | OperationStatus::Failed
+            OperationStatus::Succeeded
+                | OperationStatus::Verified
+                | OperationStatus::Failed
+                | OperationStatus::Disputed
         ) {
             return state
                 .receipts
@@ -859,19 +863,27 @@ impl Engine {
             .await;
         match result {
             Ok(result) => {
-                operation.status = OperationStatus::Succeeded;
+                operation.status = if result.verified {
+                    OperationStatus::Succeeded
+                } else {
+                    OperationStatus::Unknown
+                };
                 operation.finished_at = Some(crate::core::model::now());
                 let receipt = Receipt {
                     id: ReceiptId::new(),
                     operation_id,
-                    status: OperationStatus::Succeeded,
+                    status: operation.status.clone(),
                     external_reference: None,
                     output: result.data,
                     recorded_at: crate::core::model::now(),
                 };
-                let succeeded_event = self.event(
+                let outcome_event = self.event(
                     self.hekate_id,
-                    EventKind::OperationSucceeded,
+                    if result.verified {
+                        EventKind::OperationSucceeded
+                    } else {
+                        EventKind::OperationStateUnknown
+                    },
                     Some(EntityRef::new(EntityKind::Operation, operation.id.uuid())),
                     &operation,
                     Some(operation.id.to_string()),
@@ -883,9 +895,9 @@ impl Engine {
                     Some(EntityRef::new(EntityKind::Receipt, receipt.id.uuid())),
                     &receipt,
                     Some(operation.id.to_string()),
-                    Some(succeeded_event.event_id),
+                    Some(outcome_event.event_id),
                 )?;
-                let mut events = vec![succeeded_event, receipt_event.clone()];
+                let mut events = vec![outcome_event, receipt_event.clone()];
                 if let Some(artifact) = artifact_from_receipt(&receipt, receipt_event.event_id) {
                     events.push(self.event(
                         self.hekate_id,
@@ -896,25 +908,58 @@ impl Engine {
                         Some(receipt_event.event_id),
                     )?);
                 }
-                let verification = Verification {
-                    id: VerificationId::new(),
-                    operation_id,
-                    status: VerificationStatus::Verified,
-                    evidence: result.evidence,
-                    checked_at: crate::core::model::now(),
-                };
-                events.push(self.event(
-                    self.hekate_id,
-                    EventKind::VerificationRecorded,
-                    Some(EntityRef::new(
-                        EntityKind::Verification,
-                        verification.id.uuid(),
-                    )),
-                    &verification,
-                    Some(operation.id.to_string()),
-                    Some(receipt_event.event_id),
-                )?);
+                if result.verified {
+                    let verification = Verification {
+                        id: VerificationId::new(),
+                        operation_id,
+                        status: VerificationStatus::Verified,
+                        evidence: result.evidence,
+                        checked_at: crate::core::model::now(),
+                    };
+                    events.push(self.event(
+                        self.hekate_id,
+                        EventKind::VerificationRecorded,
+                        Some(EntityRef::new(
+                            EntityKind::Verification,
+                            verification.id.uuid(),
+                        )),
+                        &verification,
+                        Some(operation.id.to_string()),
+                        Some(receipt_event.event_id),
+                    )?);
+                }
                 self.projector.record_batch(&events, None, None).await?;
+                Ok(receipt)
+            }
+            Err(error @ CapabilityError::OutcomeUnknown(_)) => {
+                operation.status = OperationStatus::Unknown;
+                let receipt = Receipt {
+                    id: ReceiptId::new(),
+                    operation_id,
+                    status: OperationStatus::Unknown,
+                    external_reference: None,
+                    output: serde_json::json!({"error": error.to_string()}),
+                    recorded_at: crate::core::model::now(),
+                };
+                let event = self.event(
+                    self.hekate_id,
+                    EventKind::OperationStateUnknown,
+                    Some(EntityRef::new(EntityKind::Operation, operation.id.uuid())),
+                    &operation,
+                    Some(operation.id.to_string()),
+                    None,
+                )?;
+                let receipt_event = self.event(
+                    self.hekate_id,
+                    EventKind::ReceiptRecorded,
+                    Some(EntityRef::new(EntityKind::Receipt, receipt.id.uuid())),
+                    &receipt,
+                    Some(operation.id.to_string()),
+                    Some(event.event_id),
+                )?;
+                self.projector
+                    .record_batch(&[event, receipt_event], None, None)
+                    .await?;
                 Ok(receipt)
             }
             Err(error) => {
@@ -1225,6 +1270,19 @@ impl Engine {
     }
 }
 
+fn ensure_operation_matches(
+    intent: &crate::core::ActionIntent,
+    input: &serde_json::Value,
+) -> Result<(), EngineError> {
+    if input.get("operation").and_then(serde_json::Value::as_str) != Some(intent.operation.as_str())
+    {
+        return Err(EngineError::InvalidOperation(
+            "capability input operation does not match the authorized intent".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn position_event_kind(state: &CurrentState, position: &Position) -> EventKind {
     if matches!(position.status, PositionStatus::Retracted) {
         EventKind::PositionRetracted
@@ -1303,12 +1361,17 @@ fn artifact_from_receipt(
                 .map(|content| content.len() as u64)
         })
         .unwrap_or(0);
+    let media_type = object
+        .get("media_type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("text/plain")
+        .to_owned();
     Some(Artifact {
         id: ArtifactId::new(),
         path,
         content_hash,
         size,
-        media_type: "text/plain".to_owned(),
+        media_type,
         provenance_event_id,
         created_at: crate::core::model::now(),
     })

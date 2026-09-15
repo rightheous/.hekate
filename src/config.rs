@@ -24,6 +24,12 @@ pub struct Config {
     pub model_name: String,
     #[serde(default = "default_model_timeout_seconds")]
     pub model_timeout_seconds: u64,
+    #[serde(default = "default_docling_binary")]
+    pub docling_binary: PathBuf,
+    #[serde(default = "default_document_timeout_seconds")]
+    pub document_timeout_seconds: u64,
+    #[serde(default)]
+    pub browser_cdp_endpoint: Option<String>,
 }
 
 impl Default for Config {
@@ -37,6 +43,9 @@ impl Default for Config {
             model_api_key: None,
             model_name: default_model_name(),
             model_timeout_seconds: default_model_timeout_seconds(),
+            docling_binary: default_docling_binary(),
+            document_timeout_seconds: default_document_timeout_seconds(),
+            browser_cdp_endpoint: None,
         }
     }
 }
@@ -88,6 +97,19 @@ impl Config {
                     value,
                 })?;
         }
+        if let Ok(value) = std::env::var("HEKATE_DOCLING_BINARY") {
+            config.docling_binary = PathBuf::from(value);
+        }
+        if let Ok(value) = std::env::var("HEKATE_DOCUMENT_TIMEOUT_SECONDS") {
+            config.document_timeout_seconds =
+                value.parse().map_err(|_| ConfigError::InvalidEnvironment {
+                    name: "HEKATE_DOCUMENT_TIMEOUT_SECONDS".to_owned(),
+                    value,
+                })?;
+        }
+        if let Ok(value) = std::env::var("HEKATE_BROWSER_CDP_ENDPOINT") {
+            config.browser_cdp_endpoint = Some(value);
+        }
         Ok(config)
     }
 }
@@ -101,6 +123,17 @@ fn default_workspace_root() -> PathBuf {
 }
 
 fn default_model_timeout_seconds() -> u64 {
+    120
+}
+
+fn default_docling_binary() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/home/hekate"))
+        .join(".local/bin/docling-rs")
+}
+
+fn default_document_timeout_seconds() -> u64 {
     120
 }
 

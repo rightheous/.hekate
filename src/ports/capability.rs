@@ -13,10 +13,13 @@ pub struct CapabilityManifest {
 pub struct CapabilityResult {
     pub data: serde_json::Value,
     pub evidence: Vec<String>,
+    pub verified: bool,
 }
 
 #[derive(Debug, Error)]
 pub enum CapabilityError {
+    #[error("capability outcome is unknown; reconcile before retrying: {0}")]
+    OutcomeUnknown(String),
     #[error("capability input is invalid: {0}")]
     InvalidInput(String),
     #[error("capability failed: {0}")]

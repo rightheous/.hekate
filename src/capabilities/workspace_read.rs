@@ -8,9 +8,12 @@ use crate::ports::{Capability, CapabilityError, CapabilityManifest, CapabilityRe
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceReadOperation {
     List,
+    #[serde(alias = "read")]
     ReadText,
     Search,
     Metadata,
+    Hash,
+    Diff,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -20,6 +23,8 @@ pub struct WorkspaceReadRequest {
     pub path: String,
     #[serde(default)]
     pub needle: Option<String>,
+    #[serde(default, alias = "against")]
+    pub content: Option<String>,
 }
 
 pub struct WorkspaceReadCapability {
@@ -52,6 +57,7 @@ impl Capability for WorkspaceReadCapability {
                     "files": self.workspace.list(&request.path).await.map_err(map_error)?
                 }),
                 evidence: vec![request.path],
+                verified: true,
             }),
             WorkspaceReadOperation::ReadText => {
                 let file = self
@@ -63,6 +69,7 @@ impl Capability for WorkspaceReadCapability {
                     data: serde_json::to_value(&file)
                         .map_err(|error| CapabilityError::Execution(error.to_string()))?,
                     evidence: vec![file.path],
+                    verified: true,
                 })
             }
             WorkspaceReadOperation::Metadata => {
@@ -75,6 +82,35 @@ impl Capability for WorkspaceReadCapability {
                     data: serde_json::to_value(&metadata)
                         .map_err(|error| CapabilityError::Execution(error.to_string()))?,
                     evidence: vec![metadata.path.clone()],
+                    verified: true,
+                })
+            }
+            WorkspaceReadOperation::Hash => {
+                let content_hash = self
+                    .workspace
+                    .hash(&request.path)
+                    .await
+                    .map_err(map_error)?;
+                Ok(CapabilityResult {
+                    data: serde_json::json!({ "path": request.path, "content_hash": content_hash }),
+                    evidence: vec![request.path],
+                    verified: true,
+                })
+            }
+            WorkspaceReadOperation::Diff => {
+                let content = request.content.ok_or_else(|| {
+                    CapabilityError::InvalidInput("content is required for diff".to_owned())
+                })?;
+                let diff = self
+                    .workspace
+                    .diff_text(&request.path, &content)
+                    .await
+                    .map_err(map_error)?;
+                Ok(CapabilityResult {
+                    data: serde_json::to_value(&diff)
+                        .map_err(|error| CapabilityError::Execution(error.to_string()))?,
+                    evidence: vec![diff.path],
+                    verified: true,
                 })
             }
             WorkspaceReadOperation::Search => {
@@ -92,6 +128,7 @@ impl Capability for WorkspaceReadCapability {
                 Ok(CapabilityResult {
                     data: serde_json::json!({ "matches": matches }),
                     evidence: vec![request.path],
+                    verified: true,
                 })
             }
         }

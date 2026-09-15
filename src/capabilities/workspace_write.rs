@@ -7,6 +7,7 @@ use crate::ports::{Capability, CapabilityError, CapabilityManifest, CapabilityRe
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceWriteOperation {
+    #[serde(alias = "write")]
     WriteText,
     Create,
 }
@@ -50,6 +51,7 @@ impl Capability for WorkspaceWriteCapability {
             data: serde_json::to_value(&file)
                 .map_err(|error| CapabilityError::Execution(error.to_string()))?,
             evidence: vec![file.path],
+            verified: true,
         })
     }
 }
