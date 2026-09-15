@@ -2,11 +2,14 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
+use crate::adapters::computer_use::ComputerUseAdapter;
 use crate::adapters::local_policy::LocalPolicy;
 use crate::adapters::local_workspace::LocalWorkspace;
 use crate::adapters::primary_model::PrimaryModel;
 use crate::adapters::sqlite::{SqliteStore, StoreError};
-use crate::capabilities::{CapabilityRegistry, WorkspaceReadCapability, WorkspaceWriteCapability};
+use crate::capabilities::{
+    CapabilityRegistry, ComputerUseCapability, WorkspaceReadCapability, WorkspaceWriteCapability,
+};
 use crate::config::Config;
 use crate::runtime::engine::Engine;
 use crate::runtime::recovery::{recover, RecoveryError};
@@ -33,6 +36,9 @@ pub async fn build_engine(config: &Config) -> Result<Engine, BootstrapError> {
     let mut registry = CapabilityRegistry::new();
     registry.register(Arc::new(WorkspaceReadCapability::new(workspace.clone())));
     registry.register(Arc::new(WorkspaceWriteCapability::new(workspace)));
+    registry.register(Arc::new(ComputerUseCapability::new(
+        ComputerUseAdapter::new(&config.workspace_root),
+    )));
 
     Ok(Engine::new(
         store,

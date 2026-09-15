@@ -52,6 +52,7 @@ impl Capability for WorkspaceReadCapability {
                     "files": self.workspace.list(&request.path).await.map_err(map_error)?
                 }),
                 evidence: vec![request.path],
+                verified: true,
             }),
             WorkspaceReadOperation::ReadText => {
                 let file = self
@@ -63,6 +64,7 @@ impl Capability for WorkspaceReadCapability {
                     data: serde_json::to_value(&file)
                         .map_err(|error| CapabilityError::Execution(error.to_string()))?,
                     evidence: vec![file.path],
+                    verified: true,
                 })
             }
             WorkspaceReadOperation::Metadata => {
@@ -75,6 +77,7 @@ impl Capability for WorkspaceReadCapability {
                     data: serde_json::to_value(&metadata)
                         .map_err(|error| CapabilityError::Execution(error.to_string()))?,
                     evidence: vec![metadata.path.clone()],
+                    verified: true,
                 })
             }
             WorkspaceReadOperation::Search => {
@@ -92,6 +95,7 @@ impl Capability for WorkspaceReadCapability {
                 Ok(CapabilityResult {
                     data: serde_json::json!({ "matches": matches }),
                     evidence: vec![request.path],
+                    verified: true,
                 })
             }
         }

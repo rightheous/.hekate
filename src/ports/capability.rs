@@ -13,6 +13,7 @@ pub struct CapabilityManifest {
 pub struct CapabilityResult {
     pub data: serde_json::Value,
     pub evidence: Vec<String>,
+    pub verified: bool,
 }
 
 #[derive(Debug, Error)]

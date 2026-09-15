@@ -60,7 +60,12 @@ pub async fn recover(storage: &dyn Storage) -> Result<RecoveryReport, RecoveryEr
     let unknown_operations = state
         .operations
         .values()
-        .filter(|operation| matches!(operation.status, OperationStatus::Started))
+        .filter(|operation| {
+            matches!(
+                operation.status,
+                OperationStatus::Started | OperationStatus::Unknown
+            )
+        })
         .map(|operation| operation.id)
         .collect();
     let pending_approvals = state
