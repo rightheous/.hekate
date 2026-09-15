@@ -1,0 +1,5 @@
+database_url = "sqlite://var/hekate.db"
+workspace_root = "."
+model_base_url = "http://127.0.0.1:19190/v1"
+model_name = "hekate-qwen"
+model_timeout_seconds = 120

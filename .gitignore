@@ -1,0 +1,18 @@
+/target/
+/var/*.db
+/var/*.db-*
+/var/artifacts/*
+/var/logs/*
+
+# Runtime/build
+target/
+var/hekate.db
+var/logs/
+var/artifacts/
+*.db
+*.db-shm
+*.db-wal
+
+# Secrets
+.env
+.env.*
