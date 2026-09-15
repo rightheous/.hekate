@@ -12,6 +12,8 @@ pub enum WorkspaceError {
     Utf8(String),
     #[error("path escapes the workspace root")]
     Escape,
+    #[error("path is not a file")]
+    NotFile,
 }
 
 #[derive(Clone)]
@@ -155,6 +157,14 @@ impl LocalWorkspace {
             }
         }
         Ok(matches)
+    }
+
+    pub(crate) fn file_path(&self, relative: &str) -> Result<PathBuf, WorkspaceError> {
+        let path = self.allowed_path(relative)?;
+        if !path.is_file() {
+            return Err(WorkspaceError::NotFile);
+        }
+        Ok(path)
     }
 
     fn allowed_path(&self, relative: &str) -> Result<PathBuf, WorkspaceError> {

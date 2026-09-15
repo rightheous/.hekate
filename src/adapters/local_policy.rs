@@ -31,6 +31,13 @@ impl Policy for LocalPolicy {
                 reason: "workspace writes are permitted only after explicit approval".to_owned(),
             });
         }
+        if intent.capability == "document_reader" && intent.operation == "read" {
+            return Ok(PolicyDecision {
+                allowed: true,
+                requires_approval: false,
+                reason: "v1 permits read-only document conversion".to_owned(),
+            });
+        }
         Ok(PolicyDecision {
             allowed: false,
             requires_approval: false,
