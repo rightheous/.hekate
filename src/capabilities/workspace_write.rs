@@ -7,6 +7,7 @@ use crate::ports::{Capability, CapabilityError, CapabilityManifest, CapabilityRe
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceWriteOperation {
+    #[serde(alias = "write")]
     WriteText,
     Create,
 }

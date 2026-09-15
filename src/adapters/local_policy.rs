@@ -13,7 +13,7 @@ impl Policy for LocalPolicy {
         if intent.capability == "workspace_read"
             && matches!(
                 intent.operation.as_str(),
-                "list" | "read_text" | "search" | "metadata"
+                "list" | "read" | "read_text" | "search" | "metadata" | "hash" | "diff"
             )
         {
             return Ok(PolicyDecision {
@@ -23,7 +23,7 @@ impl Policy for LocalPolicy {
             });
         }
         if intent.capability == "workspace_write"
-            && matches!(intent.operation.as_str(), "write_text" | "create")
+            && matches!(intent.operation.as_str(), "write" | "write_text" | "create")
         {
             return Ok(PolicyDecision {
                 allowed: true,

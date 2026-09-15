@@ -1,7 +1,9 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use similar::TextDiff;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -42,6 +44,12 @@ pub struct WorkspaceMatch {
     pub text: String,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct WorkspaceDiff {
+    pub path: String,
+    pub diff: String,
+}
+
 impl LocalWorkspace {
     pub fn new(root: impl AsRef<Path>) -> Result<Self, WorkspaceError> {
         let root =
@@ -52,8 +60,12 @@ impl LocalWorkspace {
     pub async fn list(&self, relative: &str) -> Result<Vec<String>, WorkspaceError> {
         let start = self.allowed_path(relative)?;
         let mut pending = vec![start];
+        let mut visited = BTreeSet::new();
         let mut files = Vec::new();
         while let Some(directory) = pending.pop() {
+            if !visited.insert(directory.clone()) {
+                continue;
+            }
             let mut entries = tokio::fs::read_dir(&directory)
                 .await
                 .map_err(|error| WorkspaceError::Io(error.to_string()))?;
@@ -62,9 +74,8 @@ impl LocalWorkspace {
                 .await
                 .map_err(|error| WorkspaceError::Io(error.to_string()))?
             {
-                let path = entry.path();
-                let metadata = entry
-                    .metadata()
+                let path = self.allowed_absolute_path(&entry.path())?;
+                let metadata = tokio::fs::metadata(&path)
                     .await
                     .map_err(|error| WorkspaceError::Io(error.to_string()))?;
                 if metadata.is_dir() {
@@ -114,6 +125,25 @@ impl LocalWorkspace {
         })
     }
 
+    pub async fn hash(&self, relative: &str) -> Result<String, WorkspaceError> {
+        Ok(self.read_text(relative).await?.content_hash)
+    }
+
+    pub async fn diff_text(
+        &self,
+        relative: &str,
+        original: &str,
+    ) -> Result<WorkspaceDiff, WorkspaceError> {
+        let file = self.read_text(relative).await?;
+        Ok(WorkspaceDiff {
+            path: file.path.clone(),
+            diff: TextDiff::from_lines(original, &file.content)
+                .unified_diff()
+                .header("provided", &file.path)
+                .to_string(),
+        })
+    }
+
     pub async fn write_text(
         &self,
         relative: &str,
@@ -158,7 +188,14 @@ impl LocalWorkspace {
     }
 
     fn allowed_path(&self, relative: &str) -> Result<PathBuf, WorkspaceError> {
-        let candidate = self.root.join(relative);
+        let relative = Path::new(relative);
+        if relative.is_absolute() {
+            return Err(WorkspaceError::Escape);
+        }
+        self.allowed_absolute_path(&self.root.join(relative))
+    }
+
+    fn allowed_absolute_path(&self, candidate: &Path) -> Result<PathBuf, WorkspaceError> {
         let canonical = std::fs::canonicalize(candidate)
             .map_err(|error| WorkspaceError::Io(error.to_string()))?;
         if !canonical.starts_with(&self.root) {
@@ -173,13 +210,17 @@ impl LocalWorkspace {
             return Err(WorkspaceError::Escape);
         }
         let candidate = self.root.join(relative_path);
-        if candidate.exists() {
-            let canonical = std::fs::canonicalize(candidate)
-                .map_err(|error| WorkspaceError::Io(error.to_string()))?;
-            if !canonical.starts_with(&self.root) || !canonical.is_file() {
-                return Err(WorkspaceError::Escape);
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(_) => {
+                let canonical = std::fs::canonicalize(candidate)
+                    .map_err(|error| WorkspaceError::Io(error.to_string()))?;
+                if !canonical.starts_with(&self.root) || !canonical.is_file() {
+                    return Err(WorkspaceError::Escape);
+                }
+                return Ok(canonical);
             }
-            return Ok(canonical);
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(WorkspaceError::Io(error.to_string())),
         }
         let Some(parent) = candidate.parent() else {
             return Err(WorkspaceError::Escape);
