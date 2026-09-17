@@ -1,10 +1,16 @@
+pub mod embedding;
 pub mod event;
 pub mod model;
 pub mod transition;
 
+pub use embedding::{
+    EmbeddingDocument, EmbeddingEntityKind, EmbeddingIndexReport, EmbeddingMatch, EmbeddingRecord,
+    EmbeddingSpace, EmbeddingStatus, EmbeddingValidationError, EmbeddingVector,
+    DEFAULT_DOCUMENT_PREFIX, DEFAULT_QUERY_PREFIX,
+};
 pub use event::{EntityKind, EntityRef, EventKind, EventSource, ExperienceEvent};
 pub use model::{
-    ActionIntent, ActionIntentId, ActionProposal, ActiveMemory, ActiveMemoryStatus, Approval,
+    now, ActionIntent, ActionIntentId, ActionProposal, ActiveMemory, ActiveMemoryStatus, Approval,
     ApprovalId, ApprovalStatus, Artifact, ArtifactId, Attempt, AttemptId, AttemptStatus,
     CognitiveTrace, Commitment, CommitmentId, CommitmentStatus, CommittedJudgment, Conflict,
     ConflictId, ConflictStatus, ContextSnapshot, CurrentState, Decision, DecisionId, DecisionKind,

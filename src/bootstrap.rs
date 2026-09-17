@@ -5,6 +5,7 @@ use thiserror::Error;
 use crate::adapters::browser::BrowserAdapter;
 use crate::adapters::computer_use::ComputerUseAdapter;
 use crate::adapters::docling::Docling;
+use crate::adapters::embedding::OpenAiEmbeddingAdapter;
 use crate::adapters::git::LocalGit;
 use crate::adapters::local_policy::LocalPolicy;
 use crate::adapters::local_workspace::LocalWorkspace;
@@ -16,6 +17,7 @@ use crate::capabilities::{
     WorkspaceReadCapability, WorkspaceWriteCapability,
 };
 use crate::config::Config;
+use crate::core::{EmbeddingSpace, DEFAULT_DOCUMENT_PREFIX, DEFAULT_QUERY_PREFIX};
 use crate::runtime::engine::Engine;
 use crate::runtime::recovery::{recover, RecoveryError};
 
@@ -31,6 +33,31 @@ pub enum BootstrapError {
     Model(String),
     #[error("document reader setup failed: {0}")]
     Document(String),
+    #[error("embedding setup failed: {0}")]
+    Embedding(String),
+}
+
+pub fn embedding_space(config: &Config) -> EmbeddingSpace {
+    EmbeddingSpace::new(
+        "openai-compatible",
+        &config.embedding_model,
+        &config.embedding_revision,
+        config.embedding_dimensions,
+        true,
+        DEFAULT_QUERY_PREFIX,
+        DEFAULT_DOCUMENT_PREFIX,
+    )
+}
+
+pub fn build_embedding_provider(
+    config: &Config,
+) -> Result<Option<OpenAiEmbeddingAdapter>, BootstrapError> {
+    if !config.embedding_enabled {
+        return Ok(None);
+    }
+    OpenAiEmbeddingAdapter::from_config(config, embedding_space(config))
+        .map(Some)
+        .map_err(BootstrapError::Embedding)
 }
 
 pub async fn build_engine(config: &Config) -> Result<Engine, BootstrapError> {
@@ -40,6 +67,7 @@ pub async fn build_engine(config: &Config) -> Result<Engine, BootstrapError> {
     let workspace = LocalWorkspace::new(&config.workspace_root)
         .map_err(|error| BootstrapError::Workspace(error.to_string()))?;
     let model = PrimaryModel::from_config(config).map_err(BootstrapError::Model)?;
+    let _embedding_provider = build_embedding_provider(config)?;
     let docling = Docling::new(&config.docling_binary, config.document_timeout_seconds)
         .map_err(|error| BootstrapError::Document(error.to_string()))?;
     let mut registry = CapabilityRegistry::new();

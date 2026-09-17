@@ -1,14 +1,18 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::Parser;
 use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
-use crate::bootstrap::build_engine;
+use crate::adapters::sqlite::{SqliteEmbeddingStore, SqliteStore};
+use crate::bootstrap::{build_embedding_provider, build_engine, embedding_space};
 use crate::config::Config;
 use crate::core::{
     ApprovalId, InteractionResult, MemoryCandidateId, MemoryKind, Observation, OperationId,
 };
+use crate::ports::EmbeddingStore;
+use crate::runtime::embedding_indexer::{embedding_documents, EmbeddingIndexer};
 use crate::runtime::engine::Engine;
 
 #[derive(Debug, Parser)]
@@ -47,6 +51,12 @@ pub struct Cli {
     #[arg(long)]
     pub json: bool,
     #[arg(long)]
+    pub embedding_status: bool,
+    #[arg(long)]
+    pub embedding_index_once: bool,
+    #[arg(long)]
+    pub embedding_search: Option<String>,
+    #[arg(long)]
     pub memory_candidate: Option<String>,
     #[arg(long, default_value = "explicit_preference")]
     pub memory_kind: String,
@@ -78,12 +88,55 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     if let Some(workspace_root) = cli.workspace_root.clone() {
         config.workspace_root = workspace_root;
     }
+    if cli.embedding_status || cli.embedding_index_once || cli.embedding_search.is_some() {
+        return run_embedding_command(&config, &cli).await;
+    }
     let engine = build_engine(&config).await?;
     let result = run_command(&engine, &cli).await;
     let shutdown = engine.shutdown().await;
     result?;
     shutdown?;
     Ok(())
+}
+
+async fn run_embedding_command(config: &Config, cli: &Cli) -> anyhow::Result<()> {
+    let canonical = SqliteStore::open(&config.database_url).await?;
+    let state = canonical.state().await?;
+    let events = canonical.events().await?;
+    let space = embedding_space(config);
+    let store = Arc::new(SqliteEmbeddingStore::open(&config.database_url).await?);
+
+    if cli.embedding_status {
+        store.register_space(&space).await?;
+        let documents = embedding_documents(&state, &events)?;
+        let missing = store.discover_missing_documents(&space, &documents).await?;
+        let mut status = store.embedding_status(&space).await?;
+        status.enabled = config.embedding_enabled;
+        status.missing_record_count = missing.len() as u64;
+        println!("{}", serde_json::to_string_pretty(&status)?);
+        return Ok(());
+    }
+
+    let provider = build_embedding_provider(config)?
+        .ok_or_else(|| anyhow::anyhow!("embedding provider is disabled"))?;
+    let indexer = EmbeddingIndexer::new(Arc::new(provider), store, config.embedding_batch_size);
+    if cli.embedding_index_once {
+        let report = indexer.index_once(&state, &events).await?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    if let Some(query) = &cli.embedding_search {
+        let matches = indexer.search(query, 10).await?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "query": query,
+                "matches": matches,
+            }))?
+        );
+        return Ok(());
+    }
+    unreachable!("embedding command was selected")
 }
 
 async fn run_command(engine: &Engine, cli: &Cli) -> anyhow::Result<()> {

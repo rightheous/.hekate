@@ -30,6 +30,20 @@ pub struct Config {
     pub document_timeout_seconds: u64,
     #[serde(default)]
     pub browser_cdp_endpoint: Option<String>,
+    #[serde(default = "default_embedding_enabled")]
+    pub embedding_enabled: bool,
+    #[serde(default = "default_embedding_url")]
+    pub embedding_url: String,
+    #[serde(default = "default_embedding_model")]
+    pub embedding_model: String,
+    #[serde(default = "default_embedding_revision")]
+    pub embedding_revision: String,
+    #[serde(default = "default_embedding_dimensions")]
+    pub embedding_dimensions: usize,
+    #[serde(default = "default_embedding_timeout_seconds")]
+    pub embedding_timeout_seconds: u64,
+    #[serde(default = "default_embedding_batch_size")]
+    pub embedding_batch_size: usize,
 }
 
 impl Default for Config {
@@ -46,6 +60,13 @@ impl Default for Config {
             docling_binary: default_docling_binary(),
             document_timeout_seconds: default_document_timeout_seconds(),
             browser_cdp_endpoint: None,
+            embedding_enabled: default_embedding_enabled(),
+            embedding_url: default_embedding_url(),
+            embedding_model: default_embedding_model(),
+            embedding_revision: default_embedding_revision(),
+            embedding_dimensions: default_embedding_dimensions(),
+            embedding_timeout_seconds: default_embedding_timeout_seconds(),
+            embedding_batch_size: default_embedding_batch_size(),
         }
     }
 }
@@ -110,6 +131,43 @@ impl Config {
         if let Ok(value) = std::env::var("HEKATE_BROWSER_CDP_ENDPOINT") {
             config.browser_cdp_endpoint = Some(value);
         }
+        if let Ok(value) = std::env::var("HEKATE_EMBEDDING_ENABLED") {
+            config.embedding_enabled =
+                value.parse().map_err(|_| ConfigError::InvalidEnvironment {
+                    name: "HEKATE_EMBEDDING_ENABLED".to_owned(),
+                    value,
+                })?;
+        }
+        if let Ok(value) = std::env::var("HEKATE_EMBEDDING_URL") {
+            config.embedding_url = value;
+        }
+        if let Ok(value) = std::env::var("HEKATE_EMBEDDING_MODEL") {
+            config.embedding_model = value;
+        }
+        if let Ok(value) = std::env::var("HEKATE_EMBEDDING_REVISION") {
+            config.embedding_revision = value;
+        }
+        if let Ok(value) = std::env::var("HEKATE_EMBEDDING_DIMENSIONS") {
+            config.embedding_dimensions =
+                value.parse().map_err(|_| ConfigError::InvalidEnvironment {
+                    name: "HEKATE_EMBEDDING_DIMENSIONS".to_owned(),
+                    value,
+                })?;
+        }
+        if let Ok(value) = std::env::var("HEKATE_EMBEDDING_TIMEOUT_SECONDS") {
+            config.embedding_timeout_seconds =
+                value.parse().map_err(|_| ConfigError::InvalidEnvironment {
+                    name: "HEKATE_EMBEDDING_TIMEOUT_SECONDS".to_owned(),
+                    value,
+                })?;
+        }
+        if let Ok(value) = std::env::var("HEKATE_EMBEDDING_BATCH_SIZE") {
+            config.embedding_batch_size =
+                value.parse().map_err(|_| ConfigError::InvalidEnvironment {
+                    name: "HEKATE_EMBEDDING_BATCH_SIZE".to_owned(),
+                    value,
+                })?;
+        }
         Ok(config)
     }
 }
@@ -143,6 +201,34 @@ fn default_model_base_url() -> String {
 
 fn default_model_name() -> String {
     "hekate-qwen".to_owned()
+}
+
+fn default_embedding_enabled() -> bool {
+    true
+}
+
+fn default_embedding_url() -> String {
+    "http://127.0.0.1:19082/v1/embeddings".to_owned()
+}
+
+fn default_embedding_model() -> String {
+    "embeddinggemma".to_owned()
+}
+
+fn default_embedding_revision() -> String {
+    "embeddinggemma-q4_0-768-v1".to_owned()
+}
+
+fn default_embedding_dimensions() -> usize {
+    768
+}
+
+fn default_embedding_timeout_seconds() -> u64 {
+    30
+}
+
+fn default_embedding_batch_size() -> usize {
+    16
 }
 
 fn default_hekate_id() -> PrincipalId {

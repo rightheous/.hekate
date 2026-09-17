@@ -1,6 +1,7 @@
 pub mod contest;
 pub mod context;
 pub mod deliberation;
+pub mod embedding_indexer;
 pub mod engine;
 pub mod focus;
 pub mod projector;

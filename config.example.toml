@@ -7,3 +7,10 @@ docling_binary = "/home/hekate/.local/bin/docling-rs"
 document_timeout_seconds = 120
 # Optional trusted CDP endpoint. Without one, browser operations are unavailable.
 browser_cdp_endpoint = "http://127.0.0.1:9222"
+embedding_enabled = true
+embedding_url = "http://127.0.0.1:19082/v1/embeddings"
+embedding_model = "embeddinggemma"
+embedding_revision = "embeddinggemma-q4_0-768-v1"
+embedding_dimensions = 768
+embedding_timeout_seconds = 30
+embedding_batch_size = 16
