@@ -15,6 +15,8 @@ use crate::ports::EmbeddingStore;
 use crate::runtime::embedding_indexer::{embedding_documents, EmbeddingIndexer};
 use crate::runtime::engine::Engine;
 
+mod repl;
+
 #[derive(Debug, Parser)]
 #[command(name = "hekate", about = "HEKATE continuity runtime")]
 pub struct Cli {
@@ -26,6 +28,8 @@ pub struct Cli {
     pub workspace_root: Option<PathBuf>,
     #[arg(long)]
     pub thread_id: Option<String>,
+    #[arg(long)]
+    pub chat: bool,
     #[arg(long)]
     pub message_id: Option<String>,
     #[arg(long)]
@@ -58,10 +62,10 @@ pub struct Cli {
     pub embedding_search: Option<String>,
     #[arg(long)]
     pub memory_candidate: Option<String>,
-    #[arg(long, default_value = "explicit_preference")]
-    pub memory_kind: String,
-    #[arg(long, default_value_t = 50)]
-    pub memory_confidence: u8,
+    #[arg(long)]
+    pub memory_kind: Option<String>,
+    #[arg(long)]
+    pub memory_confidence: Option<u8>,
     #[arg(long)]
     pub promote_memory: Option<String>,
     #[arg(long)]
@@ -81,6 +85,9 @@ pub struct Cli {
 }
 
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
+    if cli.chat {
+        validate_chat_args(&cli)?;
+    }
     let mut config = Config::load(cli.config.as_deref())?;
     if let Some(database_url) = cli.database_url.clone() {
         config.database_url = database_url;
@@ -92,11 +99,109 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         return run_embedding_command(&config, &cli).await;
     }
     let engine = build_engine(&config).await?;
+    if cli.chat {
+        let thread_id = cli
+            .thread_id
+            .clone()
+            .unwrap_or_else(|| format!("cli-{}", Uuid::new_v4()));
+        let result = repl::run(&engine, thread_id).await;
+        let shutdown = engine.shutdown().await;
+        result?;
+        shutdown?;
+        return Ok(());
+    }
     let result = run_command(&engine, &cli).await;
     let shutdown = engine.shutdown().await;
     result?;
     shutdown?;
     Ok(())
+}
+
+fn validate_chat_args(cli: &Cli) -> anyhow::Result<()> {
+    let mut conflicts = Vec::new();
+    if !cli.message.is_empty() {
+        conflicts.push("MESSAGE");
+    }
+    if cli.message_id.is_some() {
+        conflicts.push("--message-id");
+    }
+    if cli.inspect {
+        conflicts.push("--inspect");
+    }
+    if cli.identity {
+        conflicts.push("--identity");
+    }
+    if cli.positions {
+        conflicts.push("--positions");
+    }
+    if cli.conflicts {
+        conflicts.push("--conflicts");
+    }
+    if cli.goals {
+        conflicts.push("--goals");
+    }
+    if cli.tasks {
+        conflicts.push("--tasks");
+    }
+    if cli.runs {
+        conflicts.push("--runs");
+    }
+    if cli.pending {
+        conflicts.push("--pending");
+    }
+    if cli.resume {
+        conflicts.push("--resume");
+    }
+    if cli.memory_list {
+        conflicts.push("--memory-list");
+    }
+    if cli.memory_kind.is_some() {
+        conflicts.push("--memory-kind");
+    }
+    if cli.memory_confidence.is_some() {
+        conflicts.push("--memory-confidence");
+    }
+    if cli.memory_candidate.is_some() {
+        conflicts.push("--memory-candidate");
+    }
+    if cli.promote_memory.is_some() {
+        conflicts.push("--promote-memory");
+    }
+    if cli.reject_memory.is_some() {
+        conflicts.push("--reject-memory");
+    }
+    if cli.supersede_memory.is_some() {
+        conflicts.push("--supersede-memory");
+    }
+    if cli.expire_memory.is_some() {
+        conflicts.push("--expire-memory");
+    }
+    if cli.approve.is_some() {
+        conflicts.push("--approve");
+    }
+    if cli.deny.is_some() {
+        conflicts.push("--deny");
+    }
+    if cli.execute.is_some() {
+        conflicts.push("--execute");
+    }
+    if cli.embedding_status {
+        conflicts.push("--embedding-status");
+    }
+    if cli.embedding_index_once {
+        conflicts.push("--embedding-index-once");
+    }
+    if cli.embedding_search.is_some() {
+        conflicts.push("--embedding-search");
+    }
+    if cli.json {
+        conflicts.push("--json");
+    }
+    if conflicts.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("--chat cannot be combined with {}", conflicts.join(", "))
+    }
 }
 
 async fn run_embedding_command(config: &Config, cli: &Cli) -> anyhow::Result<()> {
@@ -206,9 +311,9 @@ async fn run_command(engine: &Engine, cli: &Cli) -> anyhow::Result<()> {
     if let Some(content) = &cli.memory_candidate {
         let memory = engine
             .create_memory_candidate(
-                parse_memory_kind(&cli.memory_kind)?,
+                parse_memory_kind(cli.memory_kind.as_deref().unwrap_or("explicit_preference"))?,
                 content.clone(),
-                cli.memory_confidence,
+                cli.memory_confidence.unwrap_or(50),
                 false,
             )
             .await?;
