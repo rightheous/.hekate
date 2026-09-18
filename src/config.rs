@@ -181,7 +181,7 @@ fn default_workspace_root() -> PathBuf {
 }
 
 fn default_model_timeout_seconds() -> u64 {
-    120
+    300
 }
 
 fn default_docling_binary() -> PathBuf {
@@ -192,15 +192,15 @@ fn default_docling_binary() -> PathBuf {
 }
 
 fn default_document_timeout_seconds() -> u64 {
-    120
+    300
 }
 
 fn default_model_base_url() -> String {
-    "http://127.0.0.1:19190/v1".to_owned()
+    "http://127.0.0.1:19191/v1".to_owned()
 }
 
 fn default_model_name() -> String {
-    "hekate-qwen".to_owned()
+    "orcarouter/Qwen3.8-27B-Uncensored:iq4_xs".to_owned()
 }
 
 fn default_embedding_enabled() -> bool {
