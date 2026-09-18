@@ -80,6 +80,14 @@ pub trait EmbeddingStore: Send + Sync {
         space: &EmbeddingSpace,
         documents: &[EmbeddingDocument],
     ) -> Result<(), EmbeddingStoreError>;
+    async fn deactivate_entities(
+        &self,
+        space: &EmbeddingSpace,
+        entities: &[(crate::core::EmbeddingEntityKind, String)],
+    ) -> Result<(), EmbeddingStoreError> {
+        let _ = (space, entities);
+        Ok(())
+    }
     async fn search_embeddings(
         &self,
         space: &EmbeddingSpace,

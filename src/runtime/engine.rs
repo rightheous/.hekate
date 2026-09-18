@@ -13,20 +13,20 @@ use crate::core::{
     Goal, GoalId, GoalStatus, IdentityVersion, IdentityVersionId, InteractionResult,
     MemoryCandidate, MemoryCandidateId, MemoryCandidateStatus, MemoryId, MemoryKind, Observation,
     Operation, OperationId, OperationStatus, Position, PositionStatus, Principal, PrincipalId,
-    PrincipalKind, Receipt, ReceiptId, Relationship, RelationshipId, ResponseRecord, Run, RunId,
-    RunStatus, Task, TaskId, TaskStatus, Verification, VerificationId, VerificationStatus,
-    WorkingState, WorkingStateId,
+    PrincipalKind, RecallBundle, RecallQuery, Receipt, ReceiptId, Relationship, RelationshipId,
+    ResponseRecord, Run, RunId, RunStatus, Task, TaskId, TaskStatus, Verification, VerificationId,
+    VerificationStatus, WorkingState, WorkingStateId,
 };
 use crate::ports::{
     CapabilityCatalog, CapabilityError, CognitiveError, CognitiveModel, Policy, PolicyError,
     Storage, StorageError,
 };
-use crate::runtime::context::build_context;
 use crate::runtime::deliberation::{
     decision_from_cycle, validate_judgment, JudgmentValidationError,
 };
 use crate::runtime::focus::resolve_focus;
 use crate::runtime::projector::{ProjectionError, Projector};
+use crate::runtime::recall::{SemanticRecall, DEFAULT_RECALL_LIMIT};
 use crate::runtime::recovery::{recover, RecoveryError, RecoveryReport};
 
 #[derive(Debug, Error)]
@@ -71,6 +71,7 @@ pub struct Engine {
     model: Arc<dyn CognitiveModel>,
     policy: Arc<dyn Policy>,
     capabilities: Arc<dyn CapabilityCatalog>,
+    recall: Option<Arc<SemanticRecall>>,
     hekate_id: PrincipalId,
     user_id: PrincipalId,
 }
@@ -90,9 +91,15 @@ impl Engine {
             model,
             policy,
             capabilities,
+            recall: None,
             hekate_id,
             user_id,
         }
+    }
+
+    pub fn with_semantic_recall(mut self, recall: Arc<SemanticRecall>) -> Self {
+        self.recall = Some(recall);
+        self
     }
 
     pub fn hekate_id(&self) -> PrincipalId {
@@ -150,18 +157,18 @@ impl Engine {
             ));
         }
         let _ = self.ensure_identity(state).await?;
-        state = self
-            .append(
-                self.user_id,
-                EventKind::ObservationRecorded,
-                Some(EntityRef::new(
-                    EntityKind::Observation,
-                    observation.id.uuid(),
-                )),
-                &observation,
-                Some(observation.id.to_string()),
-            )
-            .await?;
+        let observation_event = self.event(
+            self.user_id,
+            EventKind::ObservationRecorded,
+            Some(EntityRef::new(
+                EntityKind::Observation,
+                observation.id.uuid(),
+            )),
+            &observation,
+            Some(observation.id.to_string()),
+            None,
+        )?;
+        state = self.projector.record(observation_event.clone()).await?;
 
         let mut focus = resolve_focus(&state, &observation);
         if focus.run_id.is_none() {
@@ -171,12 +178,21 @@ impl Engine {
         }
 
         let events = self.storage.load_events().await?;
-        let context = build_context(
+        let recall = self
+            .recall_bundle(
+                &observation.content,
+                observation_event.event_id,
+                &state,
+                &events,
+            )
+            .await;
+        let context = crate::runtime::context::build_context_with_recall(
             &state,
             &observation,
             &focus,
             &events,
             self.capabilities.names(),
+            recall,
         );
         let cycle = match self.model.think(&context).await {
             Ok(cycle) => cycle,
@@ -213,10 +229,7 @@ impl Engine {
         }
         let mut decision = decision_from_cycle(&context, &cycle);
         let trace = trace_for_decision(&cycle.trace, &decision);
-        let event_ids = events
-            .iter()
-            .map(|event| event.event_id)
-            .collect::<Vec<_>>();
+        let event_ids = evidence_event_ids(&context);
         if let Err(error) =
             validate_judgment(&context, &state, &event_ids, &decision, self.hekate_id)
         {
@@ -443,6 +456,8 @@ impl Engine {
             }
         }
 
+        let mut indexed_events = vec![observation_event];
+        indexed_events.extend(final_events.iter().cloned());
         let state = match self
             .projector
             .record_batch(&final_events, Some(context.event_sequence), Some(&trace))
@@ -469,6 +484,8 @@ impl Engine {
             }
         };
 
+        self.index_best_effort(&state, &indexed_events).await;
+
         Ok(InteractionResult {
             observation_id: observation.id,
             focus,
@@ -485,6 +502,47 @@ impl Engine {
         intent: &crate::core::ActionIntent,
     ) -> Result<crate::ports::PolicyDecision, EngineError> {
         Ok(self.policy.evaluate(actor_id, intent)?)
+    }
+
+    async fn recall_bundle(
+        &self,
+        text: &str,
+        observation_event_id: crate::core::EventId,
+        state: &CurrentState,
+        events: &[ExperienceEvent],
+    ) -> RecallBundle {
+        let query = RecallQuery {
+            text: text.to_owned(),
+            limit: DEFAULT_RECALL_LIMIT,
+            exclude_event_ids: vec![observation_event_id],
+        };
+        let Some(recall) = self.recall.as_ref() else {
+            return RecallBundle::empty(query.query_hash(), "");
+        };
+        match recall.recall(&query, state, events).await {
+            Ok(bundle) => bundle,
+            Err(error) => {
+                tracing::warn!(
+                    event_id = %observation_event_id,
+                    error = %error,
+                    "semantic recall unavailable"
+                );
+                RecallBundle::empty(query.query_hash(), recall.embedding_space_id())
+            }
+        }
+    }
+
+    async fn index_best_effort(&self, state: &CurrentState, events: &[ExperienceEvent]) {
+        let Some(recall) = self.recall.as_ref() else {
+            return;
+        };
+        if let Err(error) = recall.index_events(state, events).await {
+            tracing::warn!(
+                event_count = events.len(),
+                error = %error,
+                "incremental semantic indexing skipped"
+            );
+        }
     }
 
     pub async fn execute_capability(
@@ -628,9 +686,11 @@ impl Engine {
         } else {
             vec![promoted_event]
         };
-        self.projector
+        let committed_state = self
+            .projector
             .record_batch(&events, Some(state.revision), None)
             .await?;
+        self.index_best_effort(&committed_state, &events).await;
         Ok(memory)
     }
 
@@ -700,20 +760,20 @@ impl Engine {
             ));
         }
         memory.status = status;
-        self.projector
-            .record_batch(
-                &[self.event(
-                    self.user_id,
-                    event_kind,
-                    Some(EntityRef::new(EntityKind::Memory, memory.id.uuid())),
-                    &memory,
-                    None,
-                    None,
-                )?],
-                Some(state.revision),
-                None,
-            )
+        let event = self.event(
+            self.user_id,
+            event_kind,
+            Some(EntityRef::new(EntityKind::Memory, memory.id.uuid())),
+            &memory,
+            None,
+            None,
+        )?;
+        let committed_state = self
+            .projector
+            .record_batch(std::slice::from_ref(&event), Some(state.revision), None)
             .await?;
+        self.index_best_effort(&committed_state, std::slice::from_ref(&event))
+            .await;
         Ok(memory)
     }
 
@@ -1342,6 +1402,16 @@ fn trace_for_decision(
     }
     trace.referenced_event_ids = references;
     trace
+}
+
+fn evidence_event_ids(context: &crate::core::ThoughtContext) -> Vec<crate::core::EventId> {
+    let mut ids = context.recent_event_ids.clone();
+    for item in &context.recall.items {
+        if !ids.contains(&item.source_event_id) {
+            ids.push(item.source_event_id);
+        }
+    }
+    ids
 }
 
 fn artifact_from_receipt(

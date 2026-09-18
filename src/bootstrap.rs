@@ -10,7 +10,7 @@ use crate::adapters::git::LocalGit;
 use crate::adapters::local_policy::LocalPolicy;
 use crate::adapters::local_workspace::LocalWorkspace;
 use crate::adapters::primary_model::PrimaryModel;
-use crate::adapters::sqlite::{SqliteStore, StoreError};
+use crate::adapters::sqlite::{SqliteEmbeddingStore, SqliteStore, StoreError};
 use crate::capabilities::{
     BrowserCapability, BrowserOperation, CapabilityRegistry, ComputerUseCapability,
     DocumentReaderCapability, GitReadCapability, GitWriteCapability, UnavailableBrowserCapability,
@@ -18,7 +18,9 @@ use crate::capabilities::{
 };
 use crate::config::Config;
 use crate::core::{EmbeddingSpace, DEFAULT_DOCUMENT_PREFIX, DEFAULT_QUERY_PREFIX};
+use crate::runtime::embedding_indexer::EmbeddingIndexer;
 use crate::runtime::engine::Engine;
+use crate::runtime::recall::SemanticRecall;
 use crate::runtime::recovery::{recover, RecoveryError};
 
 #[derive(Debug, Error)]
@@ -67,7 +69,21 @@ pub async fn build_engine(config: &Config) -> Result<Engine, BootstrapError> {
     let workspace = LocalWorkspace::new(&config.workspace_root)
         .map_err(|error| BootstrapError::Workspace(error.to_string()))?;
     let model = PrimaryModel::from_config(config).map_err(BootstrapError::Model)?;
-    let _embedding_provider = build_embedding_provider(config)?;
+    let recall = if let Some(provider) = build_embedding_provider(config)? {
+        let embedding_store = Arc::new(
+            SqliteEmbeddingStore::open(&config.database_url)
+                .await
+                .map_err(|error| BootstrapError::Embedding(error.to_string()))?,
+        );
+        let indexer = Arc::new(EmbeddingIndexer::new(
+            Arc::new(provider),
+            embedding_store,
+            config.embedding_batch_size,
+        ));
+        Some(Arc::new(SemanticRecall::new(indexer)))
+    } else {
+        None
+    };
     let docling = Docling::new(&config.docling_binary, config.document_timeout_seconds)
         .map_err(|error| BootstrapError::Document(error.to_string()))?;
     let mut registry = CapabilityRegistry::new();
@@ -111,12 +127,16 @@ pub async fn build_engine(config: &Config) -> Result<Engine, BootstrapError> {
         }
     }
 
-    Ok(Engine::new(
+    let engine = Engine::new(
         store,
         Arc::new(model),
         Arc::new(LocalPolicy),
         Arc::new(registry),
         config.hekate_principal_id,
         config.user_principal_id,
-    ))
+    );
+    Ok(match recall {
+        Some(recall) => engine.with_semantic_recall(recall),
+        None => engine,
+    })
 }

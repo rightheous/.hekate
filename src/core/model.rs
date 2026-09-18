@@ -5,6 +5,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use uuid::Uuid;
 
 use super::event::ExperienceEvent;
+use super::recall::RecallBundle;
 
 macro_rules! id_type {
     ($name:ident) => {
@@ -758,6 +759,8 @@ pub struct ThoughtContext {
     pub pending_approvals: Vec<Approval>,
     #[serde(default)]
     pub artifacts: Vec<Artifact>,
+    #[serde(default)]
+    pub recall: RecallBundle,
     pub recent_event_ids: Vec<EventId>,
     pub relevant_events: Vec<ExperienceEvent>,
     pub available_capabilities: Vec<String>,

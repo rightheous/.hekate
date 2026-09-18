@@ -3,7 +3,8 @@ use uuid::Uuid;
 
 use crate::core::{
     ActiveMemoryStatus, ConflictStatus, CurrentState, ExperienceEvent, Focus,
-    MemoryCandidateStatus, Observation, PositionStatus, PrincipalKind, ThoughtContext,
+    MemoryCandidateStatus, Observation, PositionStatus, PrincipalKind, RecallBundle,
+    ThoughtContext,
 };
 
 pub fn build_context(
@@ -12,6 +13,24 @@ pub fn build_context(
     focus: &Focus,
     events: &[ExperienceEvent],
     available_capabilities: Vec<String>,
+) -> ThoughtContext {
+    build_context_with_recall(
+        state,
+        observation,
+        focus,
+        events,
+        available_capabilities,
+        RecallBundle::empty_for(&observation.content, ""),
+    )
+}
+
+pub fn build_context_with_recall(
+    state: &CurrentState,
+    observation: &Observation,
+    focus: &Focus,
+    events: &[ExperienceEvent],
+    available_capabilities: Vec<String>,
+    recall: RecallBundle,
 ) -> ThoughtContext {
     let goal = focus.goal_id.and_then(|id| state.goals.get(&id)).cloned();
     let task = focus.task_id.and_then(|id| state.tasks.get(&id)).cloned();
@@ -125,6 +144,7 @@ pub fn build_context(
             .cloned()
             .collect(),
         artifacts: state.artifacts.values().cloned().collect(),
+        recall,
         recent_event_ids,
         relevant_events,
         available_capabilities,

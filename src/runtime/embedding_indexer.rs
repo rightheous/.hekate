@@ -4,7 +4,8 @@ use thiserror::Error;
 
 use crate::core::{
     ActiveMemoryStatus, CurrentState, EmbeddingDocument, EmbeddingEntityKind, EmbeddingIndexReport,
-    EmbeddingMatch, EntityKind, EventId, ExperienceEvent, PositionStatus, Stance,
+    EmbeddingMatch, EntityKind, EventId, ExperienceEvent, ObservationId, Position, PositionId,
+    PositionStatus, Stance,
 };
 use crate::ports::{
     EmbeddingProvider, EmbeddingProviderError, EmbeddingStore, EmbeddingStoreError,
@@ -47,12 +48,58 @@ impl EmbeddingIndexer {
         state: &CurrentState,
         events: &[ExperienceEvent],
     ) -> Result<EmbeddingIndexReport, EmbeddingIndexError> {
+        let documents = embedding_documents(state, events)?;
+        let report = self.index_documents(&documents).await?;
+        let space = self.provider.space();
+        if let Err(error) = self
+            .store
+            .deactivate_missing_documents(space, &documents)
+            .await
+        {
+            let _ = self.store.record_failure(space, "storage").await;
+            return Err(error.into());
+        }
+        Ok(report)
+    }
+
+    pub async fn index_events(
+        &self,
+        state: &CurrentState,
+        events: &[ExperienceEvent],
+    ) -> Result<EmbeddingIndexReport, EmbeddingIndexError> {
+        let documents = embedding_documents_for_events(state, events)?;
+        let inactive_entities = embedding_targets(events)
+            .into_iter()
+            .filter(|(kind, entity_id)| {
+                !documents.iter().any(|document| {
+                    &document.entity_kind == kind && &document.entity_id == entity_id
+                })
+            })
+            .collect::<Vec<_>>();
+        let report = self.index_documents(&documents).await?;
+        if let Err(error) = self
+            .store
+            .deactivate_entities(self.provider.space(), &inactive_entities)
+            .await
+        {
+            let _ = self
+                .store
+                .record_failure(self.provider.space(), "storage")
+                .await;
+            return Err(error.into());
+        }
+        Ok(report)
+    }
+
+    pub async fn index_documents(
+        &self,
+        documents: &[EmbeddingDocument],
+    ) -> Result<EmbeddingIndexReport, EmbeddingIndexError> {
         let space = self.provider.space();
         self.store.register_space(space).await?;
-        let documents = embedding_documents(state, events)?;
         let missing = self
             .store
-            .discover_missing_documents(space, &documents)
+            .discover_missing_documents(space, documents)
             .await?;
         let mut report = EmbeddingIndexReport {
             discovered: documents.len() as u64,
@@ -76,15 +123,11 @@ impl EmbeddingIndexer {
         if missing.is_empty() {
             self.store.store_embeddings(space, &[], &[]).await?;
         }
-        if let Err(error) = self
-            .store
-            .deactivate_missing_documents(space, &documents)
-            .await
-        {
-            let _ = self.store.record_failure(space, "storage").await;
-            return Err(error.into());
-        }
         Ok(report)
+    }
+
+    pub fn space(&self) -> &crate::core::EmbeddingSpace {
+        self.provider.space()
     }
 
     pub async fn search(
@@ -108,7 +151,7 @@ pub fn embedding_documents(
     state: &CurrentState,
     events: &[ExperienceEvent],
 ) -> Result<Vec<EmbeddingDocument>, EmbeddingIndexError> {
-    let mut documents = Vec::new();
+    let mut documents: Vec<EmbeddingDocument> = Vec::new();
     for observation in state.observations.values() {
         documents.push(EmbeddingDocument::new(
             EmbeddingEntityKind::Observation,
@@ -134,26 +177,101 @@ pub fn embedding_documents(
         if position.status != PositionStatus::Active {
             continue;
         }
-        let reasons = position
-            .reasons
-            .iter()
-            .map(|reason| format!("- {reason}"))
-            .collect::<Vec<_>>()
-            .join("\n");
         documents.push(EmbeddingDocument::new(
             EmbeddingEntityKind::Position,
             position.id.to_string(),
             provenance(events, EntityKind::Position, position.id.uuid())?,
-            format!(
-                "subject: {}\nstance: {}\nreasons:\n{}",
-                position.subject,
-                stance(&position.stance),
-                reasons
-            ),
+            position_text(position),
             0,
         ));
     }
     Ok(documents)
+}
+
+pub fn embedding_documents_for_events(
+    state: &CurrentState,
+    events: &[ExperienceEvent],
+) -> Result<Vec<EmbeddingDocument>, EmbeddingIndexError> {
+    let mut documents: Vec<EmbeddingDocument> = Vec::new();
+    for event in events {
+        let Some(subject) = event.subject.as_ref() else {
+            continue;
+        };
+        let document = match subject.kind {
+            EntityKind::Observation => state
+                .observations
+                .get(&ObservationId::from(subject.id))
+                .map(|observation| {
+                    EmbeddingDocument::new(
+                        EmbeddingEntityKind::Observation,
+                        observation.id.to_string(),
+                        event.event_id,
+                        observation.content.clone(),
+                        0,
+                    )
+                }),
+            EntityKind::Memory => state
+                .active_memories
+                .get(&crate::core::MemoryId::from(subject.id))
+                .filter(|memory| memory.status == ActiveMemoryStatus::Active)
+                .map(|memory| {
+                    EmbeddingDocument::new(
+                        EmbeddingEntityKind::Memory,
+                        memory.id.to_string(),
+                        event.event_id,
+                        memory.content.clone(),
+                        0,
+                    )
+                }),
+            EntityKind::Position => state
+                .positions
+                .get(&PositionId::from(subject.id))
+                .filter(|position| position.status == PositionStatus::Active)
+                .map(|position| {
+                    EmbeddingDocument::new(
+                        EmbeddingEntityKind::Position,
+                        position.id.to_string(),
+                        event.event_id,
+                        position_text(position),
+                        0,
+                    )
+                }),
+            _ => None,
+        };
+        if let Some(document) = document {
+            if let Some(index) = documents.iter().position(|existing| {
+                existing.entity_kind == document.entity_kind
+                    && existing.entity_id == document.entity_id
+            }) {
+                documents[index] = document;
+            } else {
+                documents.push(document);
+            }
+        }
+    }
+    Ok(documents)
+}
+
+fn embedding_targets(events: &[ExperienceEvent]) -> Vec<(EmbeddingEntityKind, String)> {
+    let mut targets = Vec::new();
+    for event in events {
+        let Some(subject) = event.subject.as_ref() else {
+            continue;
+        };
+        let Some(kind) = (match &subject.kind {
+            EntityKind::Observation => Some(EmbeddingEntityKind::Observation),
+            EntityKind::Memory => Some(EmbeddingEntityKind::Memory),
+            EntityKind::Position => Some(EmbeddingEntityKind::Position),
+            _ => None,
+        }) else {
+            continue;
+        };
+        let target = (kind, subject.id.to_string());
+        if !targets.contains(&target) {
+            targets.push(target);
+        }
+    }
+    targets
 }
 
 fn provenance(
@@ -189,4 +307,19 @@ fn stance(value: &Stance) -> &'static str {
         Stance::Uncertain => "uncertain",
         Stance::Neutral => "neutral",
     }
+}
+
+pub(crate) fn position_text(position: &Position) -> String {
+    let reasons = position
+        .reasons
+        .iter()
+        .map(|reason| format!("- {reason}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "subject: {}\nstance: {}\nreasons:\n{}",
+        position.subject,
+        stance(&position.stance),
+        reasons
+    )
 }
