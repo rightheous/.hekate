@@ -1,6 +1,7 @@
 pub mod embedding;
 pub mod event;
 pub mod model;
+pub mod recall;
 pub mod transition;
 
 pub use embedding::{
@@ -22,3 +23,4 @@ pub use model::{
     TaskId, TaskStatus, ThoughtContext, ThoughtCycle, ThoughtDraft, Verification, VerificationId,
     VerificationStatus, WorkingState, WorkingStateId,
 };
+pub use recall::{RecallBundle, RecallQuery, RecalledItem};

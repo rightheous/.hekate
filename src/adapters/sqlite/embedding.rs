@@ -177,6 +177,31 @@ impl EmbeddingStore for SqliteEmbeddingStore {
         Ok(())
     }
 
+    async fn deactivate_entities(
+        &self,
+        space: &EmbeddingSpace,
+        entities: &[(EmbeddingEntityKind, String)],
+    ) -> Result<(), EmbeddingStoreError> {
+        if entities.is_empty() {
+            return Ok(());
+        }
+        let mut transaction = self.database.pool().begin().await.map_err(backend)?;
+        for (kind, entity_id) in entities {
+            sqlx::query(
+                "UPDATE embedding_records SET active = 0
+                 WHERE embedding_space_id = ? AND entity_kind = ? AND entity_id = ? AND active = 1",
+            )
+            .bind(&space.id)
+            .bind(entity_kind(kind))
+            .bind(entity_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(backend)?;
+        }
+        transaction.commit().await.map_err(backend)?;
+        Ok(())
+    }
+
     async fn search_embeddings(
         &self,
         space: &EmbeddingSpace,
