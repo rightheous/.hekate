@@ -5,9 +5,10 @@ use thiserror::Error;
 
 use crate::core::{
     ActiveMemory, Approval, Attempt, CognitiveTrace, Commitment, Conflict, ConflictStatus,
-    CurrentState, Decision, EventKind, ExperienceEvent, Goal, IdentityVersion, MemoryCandidate,
-    Observation, Operation, Position, PositionStatus, Principal, Receipt, Relationship, Run, Task,
-    Verification, VerificationStatus, WorkingState,
+    CurrentState, Decision, EventKind, ExperienceEvent, Goal, IdentityVersion,
+    IntegrationCandidate, MemoryCandidate, Observation, Operation, Position, PositionStatus,
+    Principal, Receipt, Relationship, Run, SleepRun, SleepRunStatus, Task, Verification,
+    VerificationStatus, WorkingState,
 };
 use crate::ports::{Storage, StorageError};
 
@@ -190,12 +191,146 @@ impl Projector {
                 }
                 state.active_memories.insert(memory.id, memory);
             }
+            EventKind::SleepRunStarted
+            | EventKind::SleepRunCompleted
+            | EventKind::SleepRunInterrupted
+            | EventKind::SleepRunFailed => apply_sleep_run(state, event)?,
+            EventKind::IntegrationCandidateCreated => {
+                let candidate: IntegrationCandidate = payload(event)?;
+                if !matches!(
+                    candidate.status,
+                    crate::core::IntegrationCandidateStatus::Pending
+                ) || candidate.content.trim().is_empty()
+                    || candidate.rationale.trim().is_empty()
+                    || candidate.source_event_ids.is_empty()
+                    || candidate.source_event_ids.len() > crate::core::MAX_CANDIDATE_SOURCES
+                    || candidate.counterevidence_event_ids.len()
+                        > crate::core::MAX_CANDIDATE_SOURCES
+                    || candidate.confidence > 100
+                {
+                    return Err(ProjectionError::InvalidPayload {
+                        event_kind: format!("{:?}", event.event_kind),
+                        message: "invalid integration candidate".to_owned(),
+                    });
+                }
+                if candidate
+                    .source_event_ids
+                    .iter()
+                    .any(|event_id| !state.applied_events.contains(event_id))
+                    || candidate
+                        .counterevidence_event_ids
+                        .iter()
+                        .any(|event_id| !state.applied_events.contains(event_id))
+                    || candidate
+                        .source_event_ids
+                        .iter()
+                        .any(|event_id| candidate.counterevidence_event_ids.contains(event_id))
+                {
+                    return Err(ProjectionError::InvalidPayload {
+                        event_kind: format!("{:?}", event.event_kind),
+                        message: "candidate provenance is not in the applied event ledger"
+                            .to_owned(),
+                    });
+                }
+                if !matches!(
+                    state.sleep_runs.get(&candidate.sleep_run_id),
+                    Some(run) if matches!(run.status, SleepRunStatus::Running)
+                ) {
+                    return Err(ProjectionError::InvalidPayload {
+                        event_kind: format!("{:?}", event.event_kind),
+                        message: "candidate does not belong to a running sleep run".to_owned(),
+                    });
+                }
+                let fingerprint = crate::core::integration_candidate_fingerprint(
+                    &candidate.kind,
+                    &candidate.content,
+                    &candidate.source_event_ids,
+                    &candidate.counterevidence_event_ids,
+                );
+                if fingerprint != candidate.fingerprint
+                    || state
+                        .integration_candidates
+                        .values()
+                        .any(|item| item.fingerprint == candidate.fingerprint)
+                {
+                    return Err(ProjectionError::InvalidPayload {
+                        event_kind: format!("{:?}", event.event_kind),
+                        message: "duplicate or invalid candidate fingerprint".to_owned(),
+                    });
+                }
+                state.integration_candidates.insert(candidate.id, candidate);
+            }
             EventKind::ResponseProduced | EventKind::StateChanged => {}
         }
         state.revision += 1;
         state.applied_events.push(event.event_id);
         Ok(())
     }
+}
+
+fn apply_sleep_run(
+    state: &mut CurrentState,
+    event: &ExperienceEvent,
+) -> Result<(), ProjectionError> {
+    let run: SleepRun = payload(event)?;
+    let error = |message: &str| ProjectionError::InvalidPayload {
+        event_kind: format!("{:?}", event.event_kind),
+        message: message.to_owned(),
+    };
+    match event.event_kind {
+        EventKind::SleepRunStarted => {
+            if state.sleep_runs.contains_key(&run.id)
+                || run.status != SleepRunStatus::Running
+                || run.cursor_before != state.sleep_cursor
+                || run.high_water_revision > state.revision
+                || run.cursor_after.is_some()
+            {
+                return Err(error("invalid sleep run start"));
+            }
+        }
+        EventKind::SleepRunCompleted
+        | EventKind::SleepRunInterrupted
+        | EventKind::SleepRunFailed => {
+            let Some(previous) = state.sleep_runs.get(&run.id) else {
+                return Err(error("sleep run terminal event has no start"));
+            };
+            if previous.status != SleepRunStatus::Running
+                || run.cursor_before != previous.cursor_before
+                || run.high_water_revision != previous.high_water_revision
+                || run.seed_event_ids != previous.seed_event_ids
+            {
+                return Err(error("invalid sleep run transition"));
+            }
+            match event.event_kind {
+                EventKind::SleepRunCompleted => {
+                    let Some(cursor_after) = run.cursor_after else {
+                        return Err(error("completed sleep run has no cursor"));
+                    };
+                    if run.status != SleepRunStatus::Completed
+                        || cursor_after < run.cursor_before
+                        || cursor_after > run.high_water_revision
+                    {
+                        return Err(error("invalid completed sleep cursor"));
+                    }
+                    state.sleep_cursor = cursor_after;
+                }
+                EventKind::SleepRunInterrupted => {
+                    if run.status != SleepRunStatus::Interrupted || run.cursor_after.is_some() {
+                        return Err(error("invalid interrupted sleep run"));
+                    }
+                }
+                EventKind::SleepRunFailed => {
+                    if run.status != SleepRunStatus::Failed || run.cursor_after.is_some() {
+                        return Err(error("invalid failed sleep run"));
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+        _ => unreachable!(),
+    }
+    state.sleep_runs.insert(run.id, run);
+    Ok(())
 }
 
 fn payload<T: DeserializeOwned>(event: &ExperienceEvent) -> Result<T, ProjectionError> {

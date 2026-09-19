@@ -70,6 +70,8 @@ id_type!(MemoryId);
 id_type!(ApprovalId);
 id_type!(ReceiptId);
 id_type!(VerificationId);
+id_type!(SleepRunId);
+id_type!(IntegrationCandidateId);
 
 pub fn now() -> String {
     OffsetDateTime::now_utc()
@@ -674,6 +676,13 @@ pub struct CurrentState {
     pub receipts: BTreeMap<ReceiptId, Receipt>,
     #[serde(default)]
     pub verifications: BTreeMap<VerificationId, Verification>,
+    #[serde(default)]
+    pub sleep_runs: BTreeMap<SleepRunId, crate::core::sleep::SleepRun>,
+    #[serde(default)]
+    pub integration_candidates:
+        BTreeMap<IntegrationCandidateId, crate::core::sleep::IntegrationCandidate>,
+    #[serde(default)]
+    pub sleep_cursor: u64,
     pub applied_events: Vec<EventId>,
 }
 
@@ -702,6 +711,9 @@ impl Default for CurrentState {
             approvals: BTreeMap::new(),
             receipts: BTreeMap::new(),
             verifications: BTreeMap::new(),
+            sleep_runs: BTreeMap::new(),
+            integration_candidates: BTreeMap::new(),
+            sleep_cursor: 0,
             applied_events: Vec::new(),
         }
     }

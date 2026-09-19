@@ -61,6 +61,10 @@ pub struct Cli {
     #[arg(long)]
     pub embedding_search: Option<String>,
     #[arg(long)]
+    pub sleep_once: bool,
+    #[arg(long)]
+    pub sleep_status: bool,
+    #[arg(long)]
     pub memory_candidate: Option<String>,
     #[arg(long)]
     pub memory_kind: Option<String>,
@@ -88,6 +92,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     if cli.chat {
         validate_chat_args(&cli)?;
     }
+    validate_sleep_args(&cli)?;
     let mut config = Config::load(cli.config.as_deref())?;
     if let Some(database_url) = cli.database_url.clone() {
         config.database_url = database_url;
@@ -114,6 +119,19 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let shutdown = engine.shutdown().await;
     result?;
     shutdown?;
+    Ok(())
+}
+
+fn validate_sleep_args(cli: &Cli) -> anyhow::Result<()> {
+    if cli.sleep_once && !cli.message.is_empty() {
+        anyhow::bail!("--sleep-once cannot be combined with MESSAGE");
+    }
+    if cli.sleep_status && !cli.message.is_empty() {
+        anyhow::bail!("--sleep-status cannot be combined with MESSAGE");
+    }
+    if cli.sleep_once && cli.sleep_status {
+        anyhow::bail!("--sleep-once cannot be combined with --sleep-status");
+    }
     Ok(())
 }
 
@@ -194,6 +212,12 @@ fn validate_chat_args(cli: &Cli) -> anyhow::Result<()> {
     if cli.embedding_search.is_some() {
         conflicts.push("--embedding-search");
     }
+    if cli.sleep_once {
+        conflicts.push("--sleep-once");
+    }
+    if cli.sleep_status {
+        conflicts.push("--sleep-status");
+    }
     if cli.json {
         conflicts.push("--json");
     }
@@ -245,6 +269,20 @@ async fn run_embedding_command(config: &Config, cli: &Cli) -> anyhow::Result<()>
 }
 
 async fn run_command(engine: &Engine, cli: &Cli) -> anyhow::Result<()> {
+    if cli.sleep_once {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&engine.sleep_once().await?)?
+        );
+        return Ok(());
+    }
+    if cli.sleep_status {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&engine.sleep_status().await?)?
+        );
+        return Ok(());
+    }
     if cli.inspect
         || cli.identity
         || cli.positions

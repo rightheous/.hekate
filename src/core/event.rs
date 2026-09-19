@@ -50,6 +50,11 @@ pub enum EventKind {
     AttemptStarted,
     AttemptCompleted,
     ArtifactCreated,
+    SleepRunStarted,
+    IntegrationCandidateCreated,
+    SleepRunCompleted,
+    SleepRunInterrupted,
+    SleepRunFailed,
     StateChanged,
 }
 
@@ -77,6 +82,8 @@ pub enum EntityKind {
     Memory,
     Attempt,
     Artifact,
+    SleepRun,
+    IntegrationCandidate,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

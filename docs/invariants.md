@@ -10,3 +10,5 @@
 - Policy decides whether an intent is allowed and whether approval is required. The model cannot execute an action by asserting that it did so.
 - Workspace paths resolve below the configured root. Writes have receipts and verification records.
 - External messages with the same channel/message identity are processed once.
+- Sleep advances its observation cursor only in the same transaction as candidate and completion events; failed or interrupted runs leave it unchanged.
+- Sleep source and counterevidence IDs must be present in the bounded sleep context, and sleep candidates never project into Memory, Position, Identity, Conflict, Relationship, or Goal state.

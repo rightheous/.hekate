@@ -19,7 +19,7 @@ use crate::core::{
 };
 use crate::ports::{
     CapabilityCatalog, CapabilityError, CognitiveError, CognitiveModel, Policy, PolicyError,
-    Storage, StorageError,
+    SleepCognitiveModel, Storage, StorageError,
 };
 use crate::runtime::deliberation::{
     decision_from_cycle, validate_judgment, JudgmentValidationError,
@@ -28,6 +28,7 @@ use crate::runtime::focus::resolve_focus;
 use crate::runtime::projector::{ProjectionError, Projector};
 use crate::runtime::recall::{SemanticRecall, DEFAULT_RECALL_LIMIT};
 use crate::runtime::recovery::{recover, RecoveryError, RecoveryReport};
+use crate::runtime::sleep::{SleepCoordinator, SleepOnceResult, SleepRuntimeError, SleepStatus};
 
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -63,12 +64,15 @@ pub enum EngineError {
     InvalidOperation(String),
     #[error(transparent)]
     Recovery(#[from] RecoveryError),
+    #[error(transparent)]
+    Sleep(#[from] SleepRuntimeError),
 }
 
 pub struct Engine {
     storage: Arc<dyn Storage>,
     projector: Projector,
     model: Arc<dyn CognitiveModel>,
+    sleep_model: Option<Arc<dyn SleepCognitiveModel>>,
     policy: Arc<dyn Policy>,
     capabilities: Arc<dyn CapabilityCatalog>,
     recall: Option<Arc<SemanticRecall>>,
@@ -89,6 +93,7 @@ impl Engine {
             projector: Projector::new(storage.clone()),
             storage,
             model,
+            sleep_model: None,
             policy,
             capabilities,
             recall: None,
@@ -99,6 +104,11 @@ impl Engine {
 
     pub fn with_semantic_recall(mut self, recall: Arc<SemanticRecall>) -> Self {
         self.recall = Some(recall);
+        self
+    }
+
+    pub fn with_sleep_model(mut self, model: Arc<dyn SleepCognitiveModel>) -> Self {
+        self.sleep_model = Some(model);
         self
     }
 
@@ -570,6 +580,23 @@ impl Engine {
 
     pub async fn recovery_report(&self) -> Result<RecoveryReport, EngineError> {
         Ok(recover(self.storage.as_ref()).await?)
+    }
+
+    pub async fn sleep_once(&self) -> Result<SleepOnceResult, EngineError> {
+        Ok(SleepCoordinator::new(
+            self.storage.as_ref(),
+            &self.projector,
+            self.sleep_model.as_deref(),
+            self.recall.as_deref(),
+            self.hekate_id,
+            self.user_id,
+        )
+        .sleep_once()
+        .await?)
+    }
+
+    pub async fn sleep_status(&self) -> Result<SleepStatus, EngineError> {
+        Ok(crate::runtime::sleep::sleep_status(self.storage.as_ref()).await?)
     }
 
     pub async fn create_memory_candidate(

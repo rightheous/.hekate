@@ -10,6 +10,6 @@ pub use capability::{
 pub use embedding::{
     EmbeddingProvider, EmbeddingProviderError, EmbeddingStore, EmbeddingStoreError,
 };
-pub use model::{CognitiveError, CognitiveModel};
+pub use model::{CognitiveError, CognitiveModel, SleepCognitiveError, SleepCognitiveModel};
 pub use policy::{Policy, PolicyDecision, PolicyError};
 pub use storage::{Storage, StorageError};
