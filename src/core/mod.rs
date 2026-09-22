@@ -27,8 +27,10 @@ pub use model::{
 };
 pub use recall::{RecallBundle, RecallQuery, RecalledItem};
 pub use sleep::{
-    integration_candidate_fingerprint, IntegrationCandidate, IntegrationCandidateDraft,
-    IntegrationCandidateKind, IntegrationCandidateStatus, SleepContext, SleepDeliberation,
-    SleepRun, SleepRunStatus, SleepSeed, SleepSelfReview, MAX_CANDIDATE_SOURCES,
-    MAX_SLEEP_CANDIDATES, MAX_SLEEP_RECALL, MAX_SLEEP_SEEDS, MAX_SLEEP_TEXT,
+    integration_candidate_fingerprint, ContextBudgetReport, ExistingRevisionType,
+    IntegrationCandidate, IntegrationCandidateDraft, IntegrationCandidateKind, SleepContext,
+    SleepDeliberation, SleepRun, SleepRunStatus, SleepSeed, SleepSelfReview,
+    VerificationDisposition, MAX_CANDIDATE_SOURCES, MAX_SLEEP_CANDIDATES, MAX_SLEEP_RECALL,
+    MAX_SLEEP_SEEDS, MAX_SLEEP_TEXT, SLEEP_ANCHOR_BUDGET_BYTES, SLEEP_CONTEXT_HARD_LIMIT_BYTES,
+    SLEEP_RECALL_BUDGET_BYTES, SLEEP_SEED_BUDGET_BYTES,
 };

@@ -6,19 +6,16 @@ use thiserror::Error;
 
 use crate::core::event::EventError;
 use crate::core::{
-    integration_candidate_fingerprint, now, ConflictStatus, EntityKind, EntityRef, EventId,
-    EventKind, EventSource, ExperienceEvent, IntegrationCandidate, IntegrationCandidateStatus,
-    RecallQuery, RecalledItem, SleepContext, SleepDeliberation, SleepRun, SleepRunId,
-    SleepRunStatus, SleepSeed, MAX_CANDIDATE_SOURCES, MAX_SLEEP_CANDIDATES, MAX_SLEEP_RECALL,
-    MAX_SLEEP_SEEDS, MAX_SLEEP_TEXT,
+    integration_candidate_fingerprint, now, ConflictStatus, ContextBudgetReport, EntityKind,
+    EntityRef, EventId, EventKind, EventSource, ExperienceEvent, IntegrationCandidate, RecallQuery,
+    RecalledItem, SleepContext, SleepDeliberation, SleepRun, SleepRunId, SleepRunStatus, SleepSeed,
+    VerificationDisposition, MAX_CANDIDATE_SOURCES, MAX_SLEEP_CANDIDATES, MAX_SLEEP_RECALL,
+    MAX_SLEEP_SEEDS, MAX_SLEEP_TEXT, SLEEP_ANCHOR_BUDGET_BYTES, SLEEP_CONTEXT_HARD_LIMIT_BYTES,
+    SLEEP_RECALL_BUDGET_BYTES, SLEEP_SEED_BUDGET_BYTES,
 };
 use crate::ports::{SleepCognitiveModel, Storage, StorageError};
 use crate::runtime::projector::{ProjectionError, Projector};
 use crate::runtime::recall::SemanticRecall;
-
-const MAX_SLEEP_POSITIONS: usize = 32;
-const MAX_SLEEP_CONFLICTS: usize = 32;
-const MAX_SLEEP_CONTEXT_BYTES: usize = 128 * 1024;
 
 #[derive(Debug, Error)]
 pub enum SleepRuntimeError {
@@ -86,6 +83,21 @@ struct SeedWindow {
     seeds: Vec<SleepSeed>,
     cursor_after: Option<u64>,
     invalid_count: usize,
+    deferred_seed_count: usize,
+}
+
+struct BuiltSleepContext {
+    context: SleepContext,
+    budget_report: ContextBudgetReport,
+}
+
+#[derive(Serialize)]
+struct SleepAnchors {
+    identity: Option<crate::core::IdentityVersion>,
+    active_positions: Vec<crate::core::Position>,
+    active_conflicts: Vec<crate::core::Conflict>,
+    relationship: Option<crate::core::Relationship>,
+    high_water_revision: u64,
 }
 
 pub struct SleepCoordinator<'a> {
@@ -141,7 +153,11 @@ impl<'a> SleepCoordinator<'a> {
                 );
             }
             if window.seeds.is_empty() {
-                return Ok(empty_result(SleepOnceStatus::Idle));
+                return Ok(empty_result(if window.deferred_seed_count > 0 {
+                    SleepOnceStatus::Deferred
+                } else {
+                    SleepOnceStatus::Idle
+                }));
             }
             let run = SleepRun {
                 id: SleepRunId::new(),
@@ -156,6 +172,7 @@ impl<'a> SleepCoordinator<'a> {
                 finished_at: None,
                 error_kind: (window.invalid_count > 0)
                     .then_some("skipped_corrupt_observation_payload".to_owned()),
+                context_budget_report: None,
             };
             let event = self.sleep_event(
                 self.hekate_id,
@@ -196,23 +213,35 @@ impl<'a> SleepCoordinator<'a> {
         }
         if window.seeds.is_empty() {
             return self
-                .fail_run(run, "corrupt_observation_payload", state)
+                .fail_run(run, "corrupt_observation_payload", state, None)
                 .await;
         }
         if self.model.is_none() {
-            return self.fail_run(run, "sleep_model_unavailable", state).await;
+            return self
+                .fail_run(run, "sleep_model_unavailable", state, None)
+                .await;
         }
 
-        let context = match self
-            .build_context(&run, &window.seeds, &events, &state)
+        let built_context = match self
+            .build_context(
+                &run,
+                &window.seeds,
+                &events,
+                &state,
+                window.deferred_seed_count,
+            )
             .await
         {
             Ok(context) => context,
             Err(error) => {
                 tracing::warn!(error = %error, "sleep context construction failed");
-                return self.fail_run(run, "context_build_failed", state).await;
+                return self
+                    .fail_run(run, "context_build_failed", state, None)
+                    .await;
             }
         };
+        let context = built_context.context;
+        let budget_report = built_context.budget_report;
         let deliberation = match self
             .model
             .expect("sleep model checked above")
@@ -224,15 +253,21 @@ impl<'a> SleepCoordinator<'a> {
                 self.record_trace(error.trace()).await;
                 let latest = self.storage.load_state().await?;
                 if latest.revision != state.revision || foreground_blocked(&latest) {
-                    return self.interrupt_run(run, latest).await;
+                    return self
+                        .interrupt_run(run, latest, Some(budget_report.clone()))
+                        .await;
                 }
-                return self.fail_run(run, error.kind(), latest).await;
+                return self
+                    .fail_run(run, error.kind(), latest, Some(budget_report.clone()))
+                    .await;
             }
         };
 
         let latest = self.storage.load_state().await?;
         if latest.revision != state.revision || foreground_blocked(&latest) {
-            return self.interrupt_run(run, latest).await;
+            return self
+                .interrupt_run(run, latest, Some(budget_report.clone()))
+                .await;
         }
 
         let candidates = match validate_deliberation(&deliberation, &context, &latest) {
@@ -241,14 +276,21 @@ impl<'a> SleepCoordinator<'a> {
                 if let Some(trace) = deliberation.trace.as_ref() {
                     self.record_trace(trace).await;
                 }
-                return self.fail_run(run, &error, latest).await;
+                return self
+                    .fail_run(run, &error, latest, Some(budget_report.clone()))
+                    .await;
             }
         };
         if let Some(trace) = deliberation.trace.as_ref() {
             if !trace.context_hash.is_empty() && trace.context_hash != context.snapshot_hash {
                 self.record_trace(trace).await;
                 return self
-                    .fail_run(run, "sleep_trace_context_mismatch", latest)
+                    .fail_run(
+                        run,
+                        "sleep_trace_context_mismatch",
+                        latest,
+                        Some(budget_report.clone()),
+                    )
                     .await;
             }
         }
@@ -262,6 +304,7 @@ impl<'a> SleepCoordinator<'a> {
         completed.created_candidate_count = candidates.len() as u32;
         completed.finished_at = Some(now());
         completed.error_kind = run.error_kind.clone();
+        completed.context_budget_report = Some(budget_report.clone());
 
         let mut events_to_commit = Vec::with_capacity(candidates.len() + 1);
         for candidate in candidates {
@@ -290,7 +333,7 @@ impl<'a> SleepCoordinator<'a> {
             Err(ProjectionError::StaleContext { .. })
             | Err(ProjectionError::Storage(StorageError::StaleContext { .. })) => {
                 let current = self.storage.load_state().await?;
-                return self.interrupt_run(run, current).await;
+                return self.interrupt_run(run, current, Some(budget_report)).await;
             }
             Err(error) => return Err(error.into()),
         };
@@ -316,7 +359,8 @@ impl<'a> SleepCoordinator<'a> {
         seeds: &[SleepSeed],
         events: &[ExperienceEvent],
         state: &crate::core::CurrentState,
-    ) -> Result<SleepContext, SleepRuntimeError> {
+        deferred_seed_count: usize,
+    ) -> Result<BuiltSleepContext, SleepRuntimeError> {
         let seed_ids = run.seed_event_ids.clone();
         let sequence_by_id = events
             .iter()
@@ -361,15 +405,14 @@ impl<'a> SleepCoordinator<'a> {
                 }
             }
         }
-        let mut recalled_experiences = recalled.into_values().collect::<Vec<_>>();
-        recalled_experiences.sort_by(|left, right| {
+        let mut recalled_candidates = recalled.into_values().collect::<Vec<_>>();
+        recalled_candidates.sort_by(|left, right| {
             right.score.total_cmp(&left.score).then_with(|| {
                 left.source_event_id
                     .to_string()
                     .cmp(&right.source_event_id.to_string())
             })
         });
-        recalled_experiences.truncate(MAX_SLEEP_RECALL);
 
         let relationship = state
             .relationships
@@ -379,13 +422,12 @@ impl<'a> SleepCoordinator<'a> {
                     && relationship.participants.contains(&self.user_id)
             })
             .cloned();
-        let mut active_positions = state
+        let active_positions = state
             .active_positions(self.hekate_id)
             .into_iter()
             .cloned()
             .collect::<Vec<_>>();
-        active_positions.truncate(MAX_SLEEP_POSITIONS);
-        let mut active_conflicts = state
+        let active_conflicts = state
             .conflicts
             .values()
             .filter(|conflict| {
@@ -396,27 +438,83 @@ impl<'a> SleepCoordinator<'a> {
             })
             .cloned()
             .collect::<Vec<_>>();
-        active_conflicts.truncate(MAX_SLEEP_CONFLICTS);
+
+        let anchors = SleepAnchors {
+            identity: state.hekate_identity().cloned(),
+            active_positions: active_positions.clone(),
+            active_conflicts: active_conflicts.clone(),
+            relationship: relationship.clone(),
+            high_water_revision: run.high_water_revision,
+        };
+        let anchor_bytes = serialized_len(&anchors)?;
+        if anchor_bytes > SLEEP_ANCHOR_BUDGET_BYTES {
+            return Err(SleepRuntimeError::Invalid(
+                "sleep anchors exceed their bounded size".to_owned(),
+            ));
+        }
+
+        let seed_observations = seeds.to_vec();
+        let seed_bytes = serialized_len(&seed_observations)?;
+        if seed_bytes > SLEEP_SEED_BUDGET_BYTES {
+            return Err(SleepRuntimeError::Invalid(
+                "sleep seeds exceed their bounded size".to_owned(),
+            ));
+        }
+
+        let mut recalled_experiences = Vec::new();
+        let mut dropped_recall_count = 0;
+        for (index, item) in recalled_candidates.into_iter().enumerate() {
+            if index >= MAX_SLEEP_RECALL {
+                dropped_recall_count += 1;
+                continue;
+            }
+            recalled_experiences.push(item);
+            if serialized_len(&recalled_experiences)? > SLEEP_RECALL_BUDGET_BYTES {
+                recalled_experiences.pop();
+                dropped_recall_count += 1;
+            }
+        }
 
         let mut context = SleepContext {
             sleep_run_id: run.id,
             high_water_revision: run.high_water_revision,
-            seed_observations: seeds.to_vec(),
+            seed_observations,
             recalled_experiences,
-            identity: state.hekate_identity().cloned(),
+            identity: anchors.identity,
             active_positions,
             active_conflicts,
-            relationship,
+            relationship: anchors.relationship,
             snapshot_hash: String::new(),
         };
-        context.snapshot_hash = context_hash(&context)?;
-        let serialized_size = serde_json::to_vec(&context)?.len();
-        if serialized_size > MAX_SLEEP_CONTEXT_BYTES {
-            return Err(SleepRuntimeError::Invalid(
-                "sleep context exceeds its bounded size".to_owned(),
-            ));
+
+        loop {
+            context.snapshot_hash = context_hash(&context)?;
+            if serialized_len(&context)? <= SLEEP_CONTEXT_HARD_LIMIT_BYTES {
+                break;
+            }
+            if context.recalled_experiences.pop().is_none() {
+                return Err(SleepRuntimeError::Invalid(
+                    "sleep context exceeds its bounded size".to_owned(),
+                ));
+            }
+            dropped_recall_count += 1;
         }
-        Ok(context)
+
+        let budget_report = ContextBudgetReport {
+            anchor_bytes,
+            seed_bytes,
+            recalled_bytes: serialized_len(&context.recalled_experiences)?,
+            total_bytes: serialized_len(&context)?,
+            included_seed_count: context.seed_observations.len(),
+            deferred_seed_count,
+            included_recall_count: context.recalled_experiences.len(),
+            dropped_recall_count,
+            hard_limit_bytes: SLEEP_CONTEXT_HARD_LIMIT_BYTES,
+        };
+        Ok(BuiltSleepContext {
+            context,
+            budget_report,
+        })
     }
 
     async fn fail_run(
@@ -424,12 +522,14 @@ impl<'a> SleepCoordinator<'a> {
         run: SleepRun,
         error_kind: &str,
         state: crate::core::CurrentState,
+        context_budget_report: Option<ContextBudgetReport>,
     ) -> Result<SleepOnceResult, SleepRuntimeError> {
         let mut failed = run;
         failed.status = SleepRunStatus::Failed;
         failed.finished_at = Some(now());
         failed.error_kind = Some(error_kind.to_owned());
         failed.cursor_after = None;
+        failed.context_budget_report = context_budget_report;
         let event = self.sleep_event(
             self.hekate_id,
             EventKind::SleepRunFailed,
@@ -452,12 +552,14 @@ impl<'a> SleepCoordinator<'a> {
         &self,
         run: SleepRun,
         state: crate::core::CurrentState,
+        context_budget_report: Option<ContextBudgetReport>,
     ) -> Result<SleepOnceResult, SleepRuntimeError> {
         let mut interrupted = run;
         interrupted.status = SleepRunStatus::Interrupted;
         interrupted.finished_at = Some(now());
         interrupted.error_kind = Some("foreground_activity".to_owned());
         interrupted.cursor_after = None;
+        interrupted.context_budget_report = context_budget_report;
         let event = self.sleep_event(
             self.hekate_id,
             EventKind::SleepRunInterrupted,
@@ -547,7 +649,12 @@ pub async fn sleep_status(storage: &dyn Storage) -> Result<SleepStatus, SleepRun
         pending_candidates: state
             .integration_candidates
             .values()
-            .filter(|candidate| matches!(candidate.status, IntegrationCandidateStatus::Pending))
+            .filter(|candidate| {
+                matches!(
+                    candidate.disposition,
+                    VerificationDisposition::NeedsValidation
+                )
+            })
             .count(),
         projection_verified,
     })
@@ -614,32 +721,54 @@ fn foreground_blocked(state: &crate::core::CurrentState) -> bool {
         })
 }
 
+fn serialized_len<T: Serialize>(value: &T) -> Result<usize, serde_json::Error> {
+    Ok(serde_json::to_vec(value)?.len())
+}
+
+fn fits_seed_budget(seeds: &[SleepSeed], candidate: &SleepSeed) -> bool {
+    let mut next = seeds.to_vec();
+    next.push(candidate.clone());
+    serialized_len(&next)
+        .map(|bytes| bytes <= SLEEP_SEED_BUDGET_BYTES)
+        .unwrap_or(false)
+}
+
 fn seed_window(events: &[ExperienceEvent], cursor: u64, high_water_revision: u64) -> SeedWindow {
-    let mut event_ids = Vec::new();
-    let mut cursor_after = None;
+    let mut seeds = Vec::new();
+    let mut invalid_count = 0;
+    let mut available_seed_count = 0usize;
+    let mut accepting = true;
     for (index, event) in events.iter().enumerate() {
         let sequence = index as u64 + 1;
         if sequence <= cursor || sequence > high_water_revision {
             continue;
         }
-        if event.event_kind == EventKind::ObservationRecorded {
-            event_ids.push(event.event_id);
-            cursor_after = Some(sequence);
-            if event_ids.len() == MAX_SLEEP_SEEDS {
-                break;
-            }
+        if event.event_kind != EventKind::ObservationRecorded {
+            continue;
         }
+        let Some(seed) = decode_seed(events, event.event_id, high_water_revision) else {
+            invalid_count += 1;
+            continue;
+        };
+        available_seed_count += 1;
+        if !accepting {
+            continue;
+        }
+        if seeds.len() >= MAX_SLEEP_SEEDS || !fits_seed_budget(&seeds, &seed) {
+            accepting = false;
+            continue;
+        }
+        seeds.push(seed);
     }
-    let seeds: Vec<SleepSeed> = event_ids
-        .iter()
-        .filter_map(|event_id| decode_seed(events, *event_id, high_water_revision))
-        .collect();
-    let invalid_count = event_ids.len().saturating_sub(seeds.len());
+    let event_ids = seeds.iter().map(|seed| seed.event_id).collect::<Vec<_>>();
+    let included_seed_count = event_ids.len();
+    let cursor_after = seeds.last().map(|seed| seed.sequence);
     SeedWindow {
         event_ids,
         seeds,
         cursor_after,
         invalid_count,
+        deferred_seed_count: available_seed_count.saturating_sub(included_seed_count),
     }
 }
 
@@ -660,11 +789,23 @@ fn seed_window_from_run(events: &[ExperienceEvent], run: &SleepRun) -> SeedWindo
         .iter()
         .filter_map(|event_id| decode_seed(events, *event_id, run.high_water_revision))
         .collect();
+    let deferred_seed_count = events
+        .iter()
+        .enumerate()
+        .filter(|(index, event)| {
+            let sequence = *index as u64 + 1;
+            sequence > cursor_after.unwrap_or(run.cursor_before)
+                && sequence <= run.high_water_revision
+                && event.event_kind == EventKind::ObservationRecorded
+        })
+        .filter(|(_, event)| decode_seed(events, event.event_id, run.high_water_revision).is_some())
+        .count();
     SeedWindow {
         event_ids: run.seed_event_ids.clone(),
         invalid_count: run.seed_event_ids.len().saturating_sub(seeds.len()),
         seeds,
         cursor_after,
+        deferred_seed_count,
     }
 }
 
@@ -782,7 +923,8 @@ fn validate_deliberation(
             id: crate::core::IntegrationCandidateId::new(),
             sleep_run_id: context.sleep_run_id,
             kind: draft.kind.clone(),
-            status: IntegrationCandidateStatus::Pending,
+            disposition: VerificationDisposition::NeedsValidation,
+            as_of_revision: context.high_water_revision,
             content: draft.content.trim().to_owned(),
             rationale: draft.rationale.trim().to_owned(),
             source_event_ids,

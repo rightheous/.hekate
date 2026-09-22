@@ -10,8 +10,8 @@ use hekate::config::Config;
 use hekate::core::{
     integration_candidate_fingerprint, now, CognitiveTrace, EntityKind, EntityRef, EventKind,
     EventSource, ExperienceEvent, IntegrationCandidate, IntegrationCandidateId,
-    IntegrationCandidateKind, IntegrationCandidateStatus, Observation, ObservationId, SleepContext,
-    SleepDeliberation, SleepRun, SleepRunId, SleepRunStatus, SleepSelfReview,
+    IntegrationCandidateKind, Observation, ObservationId, SleepContext, SleepDeliberation,
+    SleepRun, SleepRunId, SleepRunStatus, SleepSelfReview, VerificationDisposition,
 };
 use hekate::core::{EmbeddingDocument, EmbeddingSpace, EmbeddingVector};
 use hekate::ports::{
@@ -61,6 +61,7 @@ struct FakeSleepModel {
     calls: Arc<AtomicUsize>,
     contexts: Arc<Mutex<Vec<SleepContext>>>,
     invalid_source: bool,
+    confidence: u8,
 }
 
 #[async_trait]
@@ -96,7 +97,7 @@ impl SleepCognitiveModel for FakeSleepModel {
                 rationale: "the same pattern appeared in supplied history".to_owned(),
                 source_event_ids: vec![source_event_id],
                 counterevidence_event_ids: Vec::new(),
-                confidence: 80,
+                confidence: self.confidence,
             }],
             trace: None,
         })
@@ -251,6 +252,7 @@ async fn sleep_lifecycle_replays_and_advances_only_observation_cursor() {
         calls: calls.clone(),
         contexts: contexts.clone(),
         invalid_source: false,
+        confidence: 80,
     });
     let engine = engine(store.clone(), model, Some(recall));
 
@@ -337,6 +339,7 @@ async fn running_sleep_resumes_and_existing_fingerprint_is_not_duplicated() {
         started_at: now(),
         finished_at: None,
         error_kind: None,
+        context_budget_report: None,
     };
     let start = ExperienceEvent::new(
         Config::default().hekate_principal_id,
@@ -361,7 +364,8 @@ async fn running_sleep_resumes_and_existing_fingerprint_is_not_duplicated() {
         id: IntegrationCandidateId::new(),
         sleep_run_id: run.id,
         kind: IntegrationCandidateKind::Memory,
-        status: IntegrationCandidateStatus::Pending,
+        disposition: VerificationDisposition::NeedsValidation,
+        as_of_revision: run.high_water_revision,
         content: "a durable test association".to_owned(),
         rationale: "the same pattern appeared in supplied history".to_owned(),
         source_event_ids: source,
@@ -393,6 +397,7 @@ async fn running_sleep_resumes_and_existing_fingerprint_is_not_duplicated() {
             calls: calls.clone(),
             contexts: Arc::new(Mutex::new(Vec::new())),
             invalid_source: false,
+            confidence: 80,
         }),
         None,
     );
@@ -443,6 +448,7 @@ async fn invalid_provenance_fails_without_cursor_and_foreground_defers() {
             calls: calls.clone(),
             contexts: Arc::new(Mutex::new(Vec::new())),
             invalid_source: true,
+            confidence: 80,
         }),
         None,
     );
@@ -508,6 +514,7 @@ async fn invalid_provenance_fails_without_cursor_and_foreground_defers() {
             calls: calls.clone(),
             contexts: Arc::new(Mutex::new(Vec::new())),
             invalid_source: false,
+            confidence: 80,
         }),
         None,
     );
@@ -519,6 +526,108 @@ async fn invalid_provenance_fails_without_cursor_and_foreground_defers() {
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert!(store.state().await.expect("state").sleep_runs.is_empty());
     deferred_engine.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn confidence_does_not_verify_candidate() {
+    let url = database_url("verification-disposition");
+    let store = Arc::new(SqliteStore::open(&url).await.expect("store"));
+    Projector::new(store.clone())
+        .record(observation_event(&observation(
+            "confidence is not verification",
+        )))
+        .await
+        .expect("observation");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let model = Arc::new(FakeSleepModel {
+        calls: calls.clone(),
+        contexts: Arc::new(Mutex::new(Vec::new())),
+        invalid_source: false,
+        confidence: 100,
+    });
+    let sleep = engine(store.clone(), model, None);
+    let result = sleep.sleep_once().await.expect("sleep");
+    assert!(matches!(
+        result.status,
+        hekate::runtime::SleepOnceStatus::Completed
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let state = store.state().await.expect("state");
+    let candidate = state
+        .integration_candidates
+        .values()
+        .next()
+        .expect("candidate");
+    assert_eq!(candidate.confidence, 100);
+    assert_eq!(
+        candidate.disposition,
+        VerificationDisposition::NeedsValidation
+    );
+    assert_eq!(
+        candidate.as_of_revision,
+        result.high_water_revision.unwrap()
+    );
+    assert!(state
+        .sleep_runs
+        .get(&result.run_id.unwrap())
+        .and_then(|run| run.context_budget_report.as_ref())
+        .is_some());
+    assert_eq!(
+        Projector::replay(&store.events().await.expect("events")).expect("replay"),
+        state
+    );
+    sleep.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn seed_budget_defers_observations_and_advances_only_included_cursor() {
+    let url = database_url("seed-budget");
+    let store = Arc::new(SqliteStore::open(&url).await.expect("store"));
+    let projector = Projector::new(store.clone());
+    for content in ["a".repeat(22_000), "b".repeat(22_000)] {
+        projector
+            .record(observation_event(&observation(&content)))
+            .await
+            .expect("observation");
+    }
+    let calls = Arc::new(AtomicUsize::new(0));
+    let contexts = Arc::new(Mutex::new(Vec::new()));
+    let sleep = engine(
+        store.clone(),
+        Arc::new(FakeSleepModel {
+            calls: calls.clone(),
+            contexts: contexts.clone(),
+            invalid_source: false,
+            confidence: 80,
+        }),
+        None,
+    );
+
+    let first = sleep.sleep_once().await.expect("first sleep");
+    assert_eq!(first.processed_observations, 1);
+    assert_eq!(first.cursor_after, Some(1));
+    let first_context = contexts.lock().expect("contexts")[0].clone();
+    assert_eq!(first_context.seed_observations.len(), 1);
+    let first_run = store
+        .state()
+        .await
+        .expect("state")
+        .sleep_runs
+        .get(&first.run_id.expect("run"))
+        .cloned()
+        .expect("first run");
+    let report = first_run.context_budget_report.expect("budget report");
+    assert_eq!(report.included_seed_count, 1);
+    assert_eq!(report.deferred_seed_count, 1);
+    assert!(report.seed_bytes <= 32 * 1024);
+    assert!(report.total_bytes <= 80 * 1024);
+
+    let second = sleep.sleep_once().await.expect("second sleep");
+    assert_eq!(second.processed_observations, 1);
+    assert_eq!(second.cursor_after, Some(2));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(store.state().await.expect("state").sleep_cursor, 2);
+    sleep.shutdown().await.expect("shutdown");
 }
 
 fn event_for<T: serde::Serialize>(

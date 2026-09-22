@@ -196,10 +196,10 @@ impl Projector {
             | EventKind::SleepRunInterrupted
             | EventKind::SleepRunFailed => apply_sleep_run(state, event)?,
             EventKind::IntegrationCandidateCreated => {
-                let candidate: IntegrationCandidate = payload(event)?;
+                let mut candidate: IntegrationCandidate = payload(event)?;
                 if !matches!(
-                    candidate.status,
-                    crate::core::IntegrationCandidateStatus::Pending
+                    candidate.disposition,
+                    crate::core::VerificationDisposition::NeedsValidation
                 ) || candidate.content.trim().is_empty()
                     || candidate.rationale.trim().is_empty()
                     || candidate.source_event_ids.is_empty()
@@ -232,13 +232,25 @@ impl Projector {
                             .to_owned(),
                     });
                 }
-                if !matches!(
-                    state.sleep_runs.get(&candidate.sleep_run_id),
-                    Some(run) if matches!(run.status, SleepRunStatus::Running)
-                ) {
+                let Some(run) = state.sleep_runs.get(&candidate.sleep_run_id) else {
+                    return Err(ProjectionError::InvalidPayload {
+                        event_kind: format!("{:?}", event.event_kind),
+                        message: "candidate does not belong to a sleep run".to_owned(),
+                    });
+                };
+                if !matches!(run.status, SleepRunStatus::Running) {
                     return Err(ProjectionError::InvalidPayload {
                         event_kind: format!("{:?}", event.event_kind),
                         message: "candidate does not belong to a running sleep run".to_owned(),
+                    });
+                }
+                if candidate.as_of_revision == 0 && event.payload.get("as_of_revision").is_none() {
+                    candidate.as_of_revision = run.high_water_revision;
+                }
+                if candidate.as_of_revision != run.high_water_revision {
+                    return Err(ProjectionError::InvalidPayload {
+                        event_kind: format!("{:?}", event.event_kind),
+                        message: "candidate revision does not match its sleep run".to_owned(),
                     });
                 }
                 let fingerprint = crate::core::integration_candidate_fingerprint(

@@ -80,6 +80,13 @@ impl Storage for SqliteStore {
         let mut state: CurrentState = serde_json::from_str(&state_json)
             .map_err(|error| StorageError::InvalidState(error.to_string()))?;
         state.revision = revision.max(0) as u64;
+        for candidate in state.integration_candidates.values_mut() {
+            if candidate.as_of_revision == 0 {
+                if let Some(run) = state.sleep_runs.get(&candidate.sleep_run_id) {
+                    candidate.as_of_revision = run.high_water_revision;
+                }
+            }
+        }
         Ok(state)
     }
 
@@ -518,8 +525,8 @@ async fn write_projection(
             "INSERT INTO sleep_runs
              (run_id, status, high_water_revision, cursor_before, cursor_after,
               seed_event_ids_json, processed_observation_count, created_candidate_count,
-              started_at, finished_at, error_kind)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              started_at, finished_at, error_kind, context_budget_report_json)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(run.id.to_string())
         .bind(enum_text(&run.status))
@@ -532,6 +539,12 @@ async fn write_projection(
         .bind(&run.started_at)
         .bind(&run.finished_at)
         .bind(&run.error_kind)
+        .bind(
+            run.context_budget_report
+                .as_ref()
+                .map(json_text)
+                .transpose()?,
+        )
         .execute(&mut **transaction)
         .await
         .map_err(|error| StorageError::Backend(error.to_string()))?;
@@ -541,13 +554,13 @@ async fn write_projection(
             "INSERT INTO integration_candidates
              (candidate_id, sleep_run_id, kind, status, content, rationale,
               source_event_ids_json, counterevidence_event_ids_json, confidence,
-              fingerprint, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              fingerprint, created_at, disposition, as_of_revision)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(candidate.id.to_string())
         .bind(candidate.sleep_run_id.to_string())
         .bind(enum_text(&candidate.kind))
-        .bind(enum_text(&candidate.status))
+        .bind(enum_text(&candidate.disposition))
         .bind(&candidate.content)
         .bind(&candidate.rationale)
         .bind(json_text(&candidate.source_event_ids)?)
@@ -555,6 +568,8 @@ async fn write_projection(
         .bind(i64::from(candidate.confidence))
         .bind(&candidate.fingerprint)
         .bind(&candidate.created_at)
+        .bind(enum_text(&candidate.disposition))
+        .bind(candidate.as_of_revision as i64)
         .execute(&mut **transaction)
         .await
         .map_err(|error| StorageError::Backend(error.to_string()))?;
