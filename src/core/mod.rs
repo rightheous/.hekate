@@ -2,6 +2,7 @@ pub mod embedding;
 pub mod event;
 pub mod model;
 pub mod recall;
+pub mod response_profile;
 pub mod transition;
 
 pub use embedding::{
@@ -24,3 +25,8 @@ pub use model::{
     VerificationStatus, WorkingState, WorkingStateId,
 };
 pub use recall::{RecallBundle, RecallQuery, RecalledItem};
+pub use response_profile::{
+    ProgressVisibility, ResponseFormatPreference, ResponsePreferenceEvidence,
+    ResponsePreferenceKey, ResponsePreferenceScope, ResponseProfile, ResponseProfileReport,
+    ResponseProfileResolution, ResponseStepSize, ResponseVerbosity, TechnicalDepth,
+};

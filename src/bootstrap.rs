@@ -17,11 +17,15 @@ use crate::capabilities::{
     WorkspaceReadCapability, WorkspaceWriteCapability,
 };
 use crate::config::Config;
-use crate::core::{EmbeddingSpace, DEFAULT_DOCUMENT_PREFIX, DEFAULT_QUERY_PREFIX};
+use crate::core::{
+    EmbeddingSpace, ResponseProfileResolution, DEFAULT_DOCUMENT_PREFIX, DEFAULT_QUERY_PREFIX,
+};
+use crate::ports::StorageError;
 use crate::runtime::embedding_indexer::EmbeddingIndexer;
 use crate::runtime::engine::Engine;
 use crate::runtime::recall::SemanticRecall;
 use crate::runtime::recovery::{recover, RecoveryError};
+use crate::runtime::response_profile::resolve_response_profile_with_report;
 
 #[derive(Debug, Error)]
 pub enum BootstrapError {
@@ -29,6 +33,8 @@ pub enum BootstrapError {
     Store(#[from] StoreError),
     #[error(transparent)]
     Recovery(#[from] RecoveryError),
+    #[error(transparent)]
+    Storage(#[from] StorageError),
     #[error("workspace setup failed: {0}")]
     Workspace(String),
     #[error("model setup failed: {0}")]
@@ -139,4 +145,20 @@ pub async fn build_engine(config: &Config) -> Result<Engine, BootstrapError> {
         Some(recall) => engine.with_semantic_recall(recall),
         None => engine,
     })
+}
+
+pub async fn build_response_profile(
+    config: &Config,
+) -> Result<ResponseProfileResolution, BootstrapError> {
+    let store = SqliteStore::open(&config.database_url).await?;
+    let state = store.state().await?;
+    let events = store.events().await?;
+    Ok(resolve_response_profile_with_report(
+        &state,
+        &events,
+        config.user_principal_id,
+        None,
+        None,
+        state.revision,
+    ))
 }

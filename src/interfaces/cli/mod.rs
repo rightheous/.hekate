@@ -6,7 +6,9 @@ use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
 use crate::adapters::sqlite::{SqliteEmbeddingStore, SqliteStore};
-use crate::bootstrap::{build_embedding_provider, build_engine, embedding_space};
+use crate::bootstrap::{
+    build_embedding_provider, build_engine, build_response_profile, embedding_space,
+};
 use crate::config::Config;
 use crate::core::{
     ApprovalId, InteractionResult, MemoryCandidateId, MemoryKind, Observation, OperationId,
@@ -53,6 +55,8 @@ pub struct Cli {
     #[arg(long)]
     pub memory_list: bool,
     #[arg(long)]
+    pub response_profile: bool,
+    #[arg(long)]
     pub json: bool,
     #[arg(long)]
     pub embedding_status: bool,
@@ -95,6 +99,15 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     if let Some(workspace_root) = cli.workspace_root.clone() {
         config.workspace_root = workspace_root;
     }
+    if cli.response_profile {
+        validate_response_profile_args(&cli)?;
+        let resolution = build_response_profile(&config).await?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&response_profile_json(&resolution))?
+        );
+        return Ok(());
+    }
     if cli.embedding_status || cli.embedding_index_once || cli.embedding_search.is_some() {
         return run_embedding_command(&config, &cli).await;
     }
@@ -115,6 +128,102 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     result?;
     shutdown?;
     Ok(())
+}
+
+fn validate_response_profile_args(cli: &Cli) -> anyhow::Result<()> {
+    let mut conflicts = Vec::new();
+    if cli.chat {
+        conflicts.push("--chat");
+    }
+    if !cli.message.is_empty() {
+        conflicts.push("MESSAGE");
+    }
+    if cli.message_id.is_some() {
+        conflicts.push("--message-id");
+    }
+    if cli.thread_id.is_some() {
+        conflicts.push("--thread-id");
+    }
+    if cli.inspect {
+        conflicts.push("--inspect");
+    }
+    if cli.identity {
+        conflicts.push("--identity");
+    }
+    if cli.positions {
+        conflicts.push("--positions");
+    }
+    if cli.conflicts {
+        conflicts.push("--conflicts");
+    }
+    if cli.goals {
+        conflicts.push("--goals");
+    }
+    if cli.tasks {
+        conflicts.push("--tasks");
+    }
+    if cli.runs {
+        conflicts.push("--runs");
+    }
+    if cli.pending {
+        conflicts.push("--pending");
+    }
+    if cli.resume {
+        conflicts.push("--resume");
+    }
+    if cli.memory_list {
+        conflicts.push("--memory-list");
+    }
+    if cli.memory_kind.is_some() {
+        conflicts.push("--memory-kind");
+    }
+    if cli.memory_confidence.is_some() {
+        conflicts.push("--memory-confidence");
+    }
+    if cli.memory_candidate.is_some() {
+        conflicts.push("--memory-candidate");
+    }
+    if cli.promote_memory.is_some() {
+        conflicts.push("--promote-memory");
+    }
+    if cli.reject_memory.is_some() {
+        conflicts.push("--reject-memory");
+    }
+    if cli.supersede_memory.is_some() {
+        conflicts.push("--supersede-memory");
+    }
+    if cli.expire_memory.is_some() {
+        conflicts.push("--expire-memory");
+    }
+    if cli.approve.is_some() {
+        conflicts.push("--approve");
+    }
+    if cli.deny.is_some() {
+        conflicts.push("--deny");
+    }
+    if cli.execute.is_some() {
+        conflicts.push("--execute");
+    }
+    if cli.embedding_status {
+        conflicts.push("--embedding-status");
+    }
+    if cli.embedding_index_once {
+        conflicts.push("--embedding-index-once");
+    }
+    if cli.embedding_search.is_some() {
+        conflicts.push("--embedding-search");
+    }
+    if cli.json {
+        conflicts.push("--json");
+    }
+    if conflicts.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "--response-profile cannot be combined with {}",
+            conflicts.join(", ")
+        )
+    }
 }
 
 fn validate_chat_args(cli: &Cli) -> anyhow::Result<()> {
@@ -395,6 +504,37 @@ async fn run_command(engine: &Engine, cli: &Cli) -> anyhow::Result<()> {
         .await?;
     println!("{}", render_interaction_result(&result, cli.json)?);
     Ok(())
+}
+
+fn response_profile_json(resolution: &crate::core::ResponseProfileResolution) -> serde_json::Value {
+    let profile = &resolution.profile;
+    let evidence = profile
+        .evidence
+        .iter()
+        .map(|evidence| {
+            serde_json::json!({
+                "memory_id": evidence.memory_id,
+                "source_event_id": evidence.source_event_id,
+                "key": evidence.key,
+                "scope": evidence.scope,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "profile": {
+            "language": profile.language,
+            "verbosity": profile.verbosity,
+            "step_size": profile.step_size,
+            "progress_visibility": profile.progress_visibility,
+            "next_action_first": profile.next_action_first,
+            "technical_depth": profile.technical_depth,
+            "preferred_format": profile.preferred_format,
+        },
+        "evidence": evidence,
+        "as_of_revision": profile.as_of_revision,
+        "profile_hash": profile.profile_hash,
+        "report": resolution.report,
+    })
 }
 
 fn render_interaction_result(result: &InteractionResult, json: bool) -> anyhow::Result<String> {
