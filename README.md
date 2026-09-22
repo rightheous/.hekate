@@ -5,7 +5,7 @@ HEKATE is a persistent Rust/Tokio/SQLite runtime for one continuing relationship
 The default model endpoint is the already running Hermes service:
 
 ```text
-http://127.0.0.1:19190/v1  model: hekate-qwen
+http://127.0.0.1:19191/v1  model: orcarouter/Qwen3.8-27B-Uncensored:iq4_xs
 ```
 
 HEKATE does not add a provider or download a model. Override the endpoint, model, database, or workspace with `config.example.toml` or `HEKATE_*` environment variables. The local Hermes endpoint does not require an API key; an optional `HEKATE_MODEL_API_KEY` is supported for compatible deployments.
