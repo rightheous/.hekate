@@ -9,17 +9,21 @@ use crate::core::event::{
 use crate::core::transition::{transition_operation, transition_run, TransitionError};
 use crate::core::{
     ActiveMemory, ActiveMemoryStatus, Approval, ApprovalId, ApprovalStatus, Artifact, ArtifactId,
-    Attempt, AttemptStatus, CognitiveTrace, ConflictStatus, CurrentState, DecisionKind, Focus,
-    Goal, GoalId, GoalStatus, IdentityVersion, IdentityVersionId, InteractionResult,
-    MemoryCandidate, MemoryCandidateId, MemoryCandidateStatus, MemoryId, MemoryKind, Observation,
-    Operation, OperationId, OperationStatus, Position, PositionStatus, Principal, PrincipalId,
-    PrincipalKind, RecallBundle, RecallQuery, Receipt, ReceiptId, Relationship, RelationshipId,
-    ResponseRecord, Run, RunId, RunStatus, Task, TaskId, TaskStatus, Verification, VerificationId,
-    VerificationStatus, WorkingState, WorkingStateId,
+    Attempt, AttemptStatus, CognitiveTrace, CompletionClaim, CompletionClaimId,
+    CompletionCriterion, CompletionCriterionId, ConflictStatus, CurrentState, DecisionKind,
+    EvidenceRef, Focus, Goal, GoalId, GoalStatus, IdentityVersion, IdentityVersionId,
+    InteractionResult, MemoryCandidate, MemoryCandidateId, MemoryCandidateStatus, MemoryId,
+    MemoryKind, Observation, Operation, OperationId, OperationStatus, Position, PositionStatus,
+    Principal, PrincipalId, PrincipalKind, RecallBundle, RecallQuery, Receipt, ReceiptId,
+    Relationship, RelationshipId, ResponseRecord, Run, RunId, RunStatus, Task, TaskId, TaskStatus,
+    Verification, VerificationId, VerificationStatus, WorkingState, WorkingStateId,
 };
 use crate::ports::{
     CapabilityCatalog, CapabilityError, CognitiveError, CognitiveModel, Policy, PolicyError,
     Storage, StorageError,
+};
+use crate::runtime::completion::{
+    CompletionError, CompletionGate, CompletionGateResult, CompletionStatusReport,
 };
 use crate::runtime::deliberation::{
     decision_from_cycle, validate_judgment, JudgmentValidationError,
@@ -61,6 +65,8 @@ pub enum EngineError {
     NotFound(String),
     #[error("operation cannot continue: {0}")]
     InvalidOperation(String),
+    #[error(transparent)]
+    Completion(#[from] CompletionError),
     #[error(transparent)]
     Recovery(#[from] RecoveryError),
 }
@@ -570,6 +576,97 @@ impl Engine {
 
     pub async fn recovery_report(&self) -> Result<RecoveryReport, EngineError> {
         Ok(recover(self.storage.as_ref()).await?)
+    }
+
+    pub fn completion_gate(&self) -> CompletionGate {
+        CompletionGate::new(self.storage.clone())
+    }
+
+    pub async fn define_completion_criterion(
+        &self,
+        task_id: TaskId,
+        description: impl Into<String>,
+        required: bool,
+    ) -> Result<CompletionCriterion, EngineError> {
+        Ok(self
+            .completion_gate()
+            .define_criterion(self.user_id, task_id, description, required)
+            .await?)
+    }
+
+    pub async fn create_completion_claim(
+        &self,
+        task_id: TaskId,
+        criterion_id: CompletionCriterionId,
+        confidence: u8,
+        evidence_refs: Vec<EvidenceRef>,
+        blocker: Option<String>,
+        supersedes: Option<CompletionClaimId>,
+    ) -> Result<CompletionClaim, EngineError> {
+        Ok(self
+            .completion_gate()
+            .create_claim(
+                self.user_id,
+                task_id,
+                criterion_id,
+                confidence,
+                evidence_refs,
+                blocker,
+                supersedes,
+            )
+            .await?)
+    }
+
+    pub async fn verify_completion_claim(
+        &self,
+        claim_id: CompletionClaimId,
+        actor_id: PrincipalId,
+        reason: impl Into<String>,
+    ) -> Result<CompletionClaim, EngineError> {
+        if actor_id == self.hekate_id {
+            return Err(CompletionError::ModelCannotVerify.into());
+        }
+        Ok(self
+            .completion_gate()
+            .verify_claim(actor_id, claim_id, reason)
+            .await?)
+    }
+
+    pub async fn reject_completion_claim(
+        &self,
+        claim_id: CompletionClaimId,
+        actor_id: PrincipalId,
+        reason: impl Into<String>,
+    ) -> Result<CompletionClaim, EngineError> {
+        if actor_id == self.hekate_id {
+            return Err(CompletionError::ModelCannotVerify.into());
+        }
+        Ok(self
+            .completion_gate()
+            .reject_claim(actor_id, claim_id, reason)
+            .await?)
+    }
+
+    pub async fn evaluate_task_completion(
+        &self,
+        task_id: TaskId,
+        as_of_sequence: u64,
+    ) -> Result<CompletionGateResult, EngineError> {
+        Ok(self
+            .completion_gate()
+            .evaluate_task_completion(task_id, as_of_sequence)
+            .await?)
+    }
+
+    pub async fn completion_status(
+        &self,
+        task_id: TaskId,
+        as_of_sequence: u64,
+    ) -> Result<CompletionStatusReport, EngineError> {
+        Ok(self
+            .completion_gate()
+            .status(task_id, as_of_sequence)
+            .await?)
     }
 
     pub async fn create_memory_candidate(

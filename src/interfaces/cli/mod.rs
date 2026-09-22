@@ -44,6 +44,10 @@ pub struct Cli {
     pub goals: bool,
     #[arg(long)]
     pub tasks: bool,
+    #[arg(long, value_name = "TASK_ID")]
+    pub completion_status: Option<String>,
+    #[arg(long)]
+    pub completion_claims: bool,
     #[arg(long)]
     pub runs: bool,
     #[arg(long)]
@@ -88,6 +92,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     if cli.chat {
         validate_chat_args(&cli)?;
     }
+    validate_completion_args(&cli)?;
     let mut config = Config::load(cli.config.as_deref())?;
     if let Some(database_url) = cli.database_url.clone() {
         config.database_url = database_url;
@@ -142,6 +147,12 @@ fn validate_chat_args(cli: &Cli) -> anyhow::Result<()> {
     }
     if cli.tasks {
         conflicts.push("--tasks");
+    }
+    if cli.completion_status.is_some() {
+        conflicts.push("--completion-status");
+    }
+    if cli.completion_claims {
+        conflicts.push("--completion-claims");
     }
     if cli.runs {
         conflicts.push("--runs");
@@ -204,6 +215,15 @@ fn validate_chat_args(cli: &Cli) -> anyhow::Result<()> {
     }
 }
 
+fn validate_completion_args(cli: &Cli) -> anyhow::Result<()> {
+    if (cli.completion_status.is_some() || cli.completion_claims)
+        && (!cli.message.is_empty() || cli.message_id.is_some())
+    {
+        anyhow::bail!("completion queries cannot be combined with MESSAGE or --message-id")
+    }
+    Ok(())
+}
+
 async fn run_embedding_command(config: &Config, cli: &Cli) -> anyhow::Result<()> {
     let canonical = SqliteStore::open(&config.database_url).await?;
     let state = canonical.state().await?;
@@ -251,6 +271,8 @@ async fn run_command(engine: &Engine, cli: &Cli) -> anyhow::Result<()> {
         || cli.conflicts
         || cli.goals
         || cli.tasks
+        || cli.completion_status.is_some()
+        || cli.completion_claims
         || cli.runs
         || cli.pending
     {
@@ -269,6 +291,28 @@ async fn run_command(engine: &Engine, cli: &Cli) -> anyhow::Result<()> {
             serde_json::json!({"goals": state.goals})
         } else if cli.tasks {
             serde_json::json!({"tasks": state.tasks})
+        } else if let Some(task_id) = &cli.completion_status {
+            let task_id = parse_id(task_id)?;
+            let report = engine.completion_status(task_id, state.revision).await?;
+            serde_json::to_value(report)?
+        } else if cli.completion_claims {
+            let claims = state
+                .completion_claims
+                .values()
+                .map(|claim| {
+                    serde_json::json!({
+                        "claim_id": claim.id,
+                        "task_id": claim.task_id,
+                        "criterion_id": claim.criterion_id,
+                        "disposition": claim.disposition,
+                        "confidence": claim.confidence,
+                        "fingerprint": claim.fingerprint,
+                        "evidence_count": claim.evidence_refs.len(),
+                        "as_of_sequence": claim.as_of_sequence,
+                    })
+                })
+                .collect::<Vec<_>>();
+            serde_json::json!({"claims": claims})
         } else if cli.runs {
             serde_json::json!({
                 "runs": state.runs,

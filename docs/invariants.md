@@ -10,3 +10,5 @@
 - Policy decides whether an intent is allowed and whether approval is required. The model cannot execute an action by asserting that it did so.
 - Workspace paths resolve below the configured root. Writes have receipts and verification records.
 - External messages with the same channel/message identity are processed once.
+- Completion claims start at `needs_validation`; only an explicit non-model actor can move them to `verified` or `rejected`.
+- Verified completion claims require ledger/artifact provenance, a valid as-of sequence, and no blocker. Confidence never grants verification.

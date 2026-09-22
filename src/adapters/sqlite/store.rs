@@ -1,15 +1,14 @@
 use async_trait::async_trait;
 use serde::Serialize;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use sqlx::{Row, Sqlite, Transaction};
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::adapters::sqlite::database::{Database, DatabaseError};
 use crate::core::{
-    CognitiveTrace, CurrentState, EntityKind, EntityRef, EventId, EventKind, EventSource,
-    ExperienceEvent,
+    normalize_description, sha256_hex, CognitiveTrace, CurrentState, EntityKind, EntityRef,
+    EventId, EventKind, EventSource, ExperienceEvent,
 };
 use crate::ports::{Storage, StorageError};
 
@@ -276,6 +275,8 @@ async fn write_projection(
     state: &CurrentState,
 ) -> Result<(), StorageError> {
     for table in [
+        "completion_claims",
+        "completion_criteria",
         "principals",
         "identity_versions",
         "goals",
@@ -508,6 +509,44 @@ async fn write_projection(
         .bind(json_text(verification)?)
         .execute(&mut **transaction)
         .await
+            .map_err(|error| StorageError::Backend(error.to_string()))?;
+    }
+    for criterion in state.completion_criteria.values() {
+        sqlx::query(
+            "INSERT INTO completion_criteria
+             (criterion_id, task_id, description, normalized_description, required, created_at)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(criterion.id.to_string())
+        .bind(criterion.task_id.to_string())
+        .bind(&criterion.description)
+        .bind(normalize_description(&criterion.description))
+        .bind(if criterion.required { 1_i64 } else { 0_i64 })
+        .bind(&criterion.created_at)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|error| StorageError::Backend(error.to_string()))?;
+    }
+    for claim in state.completion_claims.values() {
+        sqlx::query(
+            "INSERT INTO completion_claims
+             (claim_id, task_id, criterion_id, disposition, confidence, evidence_json, blocker,
+              fingerprint, as_of_sequence, supersedes, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(claim.id.to_string())
+        .bind(claim.task_id.to_string())
+        .bind(claim.criterion_id.to_string())
+        .bind(enum_text(&claim.disposition))
+        .bind(i64::from(claim.confidence))
+        .bind(json_text(&claim.evidence_refs)?)
+        .bind(&claim.blocker)
+        .bind(&claim.fingerprint)
+        .bind(claim.as_of_sequence as i64)
+        .bind(claim.supersedes.map(|id| id.to_string()))
+        .bind(&claim.created_at)
+        .execute(&mut **transaction)
+        .await
         .map_err(|error| StorageError::Backend(error.to_string()))?;
     }
     Ok(())
@@ -525,10 +564,7 @@ fn enum_text<T: Serialize>(value: &T) -> String {
 }
 
 fn snapshot_hash(value: &str) -> String {
-    Sha256::digest(value.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    sha256_hex(value.as_bytes())
 }
 
 fn event_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<ExperienceEvent, StorageError> {

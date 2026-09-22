@@ -70,6 +70,8 @@ id_type!(MemoryId);
 id_type!(ApprovalId);
 id_type!(ReceiptId);
 id_type!(VerificationId);
+id_type!(CompletionCriterionId);
+id_type!(CompletionClaimId);
 
 pub fn now() -> String {
     OffsetDateTime::now_utc()
@@ -674,6 +676,11 @@ pub struct CurrentState {
     pub receipts: BTreeMap<ReceiptId, Receipt>,
     #[serde(default)]
     pub verifications: BTreeMap<VerificationId, Verification>,
+    #[serde(default)]
+    pub completion_criteria:
+        BTreeMap<CompletionCriterionId, crate::core::evidence::CompletionCriterion>,
+    #[serde(default)]
+    pub completion_claims: BTreeMap<CompletionClaimId, crate::core::evidence::CompletionClaim>,
     pub applied_events: Vec<EventId>,
 }
 
@@ -702,6 +709,8 @@ impl Default for CurrentState {
             approvals: BTreeMap::new(),
             receipts: BTreeMap::new(),
             verifications: BTreeMap::new(),
+            completion_criteria: BTreeMap::new(),
+            completion_claims: BTreeMap::new(),
             applied_events: Vec::new(),
         }
     }

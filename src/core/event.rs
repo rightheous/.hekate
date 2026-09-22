@@ -1,6 +1,5 @@
 use crate::core::model::{now, EventId, PrincipalId};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -50,6 +49,10 @@ pub enum EventKind {
     AttemptStarted,
     AttemptCompleted,
     ArtifactCreated,
+    CompletionCriterionDefined,
+    CompletionClaimCreated,
+    CompletionClaimVerified,
+    CompletionClaimRejected,
     StateChanged,
 }
 
@@ -77,6 +80,8 @@ pub enum EntityKind {
     Memory,
     Attempt,
     Artifact,
+    CompletionCriterion,
+    CompletionClaim,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -187,11 +192,14 @@ impl ExperienceEvent {
         Ok(self.integrity_hash == self.calculate_hash()?)
     }
 
+    pub fn canonical_hash(&self) -> Result<String, EventError> {
+        self.calculate_hash()
+    }
+
     fn calculate_hash(&self) -> Result<String, EventError> {
         let mut unsigned = self.clone();
         unsigned.integrity_hash.clear();
         let bytes = serde_json::to_vec(&unsigned)?;
-        let digest = Sha256::digest(bytes);
-        Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+        Ok(super::evidence::sha256_hex(&bytes))
     }
 }
