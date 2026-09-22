@@ -8,6 +8,7 @@ pub mod focus;
 pub mod projector;
 pub mod recall;
 pub mod recovery;
+pub mod response_profile;
 pub mod sleep;
 
 pub use completion::{

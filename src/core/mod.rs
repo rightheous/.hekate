@@ -3,6 +3,7 @@ pub mod event;
 pub mod evidence;
 pub mod model;
 pub mod recall;
+pub mod response_profile;
 pub mod sleep;
 pub mod transition;
 
@@ -32,6 +33,11 @@ pub use model::{
     VerificationId, VerificationStatus, WorkingState, WorkingStateId,
 };
 pub use recall::{RecallBundle, RecallQuery, RecalledItem};
+pub use response_profile::{
+    ProgressVisibility, ResponseFormatPreference, ResponsePreferenceEvidence,
+    ResponsePreferenceKey, ResponsePreferenceScope, ResponseProfile, ResponseProfileReport,
+    ResponseProfileResolution, ResponseStepSize, ResponseVerbosity, TechnicalDepth,
+};
 pub use sleep::{
     integration_candidate_fingerprint, ContextBudgetReport, ExistingRevisionType,
     IntegrationCandidate, IntegrationCandidateDraft, IntegrationCandidateKind, SleepContext,
