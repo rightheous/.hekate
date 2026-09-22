@@ -18,6 +18,8 @@ cargo run -- --thread-id thread-1 --message-id message-1 "What should we do next
 
 Useful commands are `--inspect`, `--identity`, `--positions`, `--conflicts`, `--pending`, and `--resume`. Memory candidates use `--memory-candidate TEXT`, `--memory-list`, `--promote-memory ID`, and `--reject-memory ID`.
 
+Run one bounded background sleep pass with `--sleep-once`; inspect its cursor, active run, candidates, and projection verification with `--sleep-status`.
+
 Action proposals are persisted as planned operations. A write proposal returns an approval ID; resolve it with `--approve ID` or `--deny ID`, then execute the operation with `--execute ID`. Execution records a receipt, verification, and artifact provenance where the result identifies a file.
 
 Required checks:

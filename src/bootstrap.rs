@@ -68,7 +68,7 @@ pub async fn build_engine(config: &Config) -> Result<Engine, BootstrapError> {
 
     let workspace = LocalWorkspace::new(&config.workspace_root)
         .map_err(|error| BootstrapError::Workspace(error.to_string()))?;
-    let model = PrimaryModel::from_config(config).map_err(BootstrapError::Model)?;
+    let model = Arc::new(PrimaryModel::from_config(config).map_err(BootstrapError::Model)?);
     let recall = if let Some(provider) = build_embedding_provider(config)? {
         let embedding_store = Arc::new(
             SqliteEmbeddingStore::open(&config.database_url)
@@ -129,12 +129,13 @@ pub async fn build_engine(config: &Config) -> Result<Engine, BootstrapError> {
 
     let engine = Engine::new(
         store,
-        Arc::new(model),
+        model.clone(),
         Arc::new(LocalPolicy),
         Arc::new(registry),
         config.hekate_principal_id,
         config.user_principal_id,
-    );
+    )
+    .with_sleep_model(model);
     Ok(match recall {
         Some(recall) => engine.with_semantic_recall(recall),
         None => engine,
