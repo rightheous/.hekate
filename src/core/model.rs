@@ -72,6 +72,8 @@ id_type!(ReceiptId);
 id_type!(VerificationId);
 id_type!(SleepRunId);
 id_type!(IntegrationCandidateId);
+id_type!(CompletionCriterionId);
+id_type!(CompletionClaimId);
 
 pub fn now() -> String {
     OffsetDateTime::now_utc()
@@ -683,6 +685,11 @@ pub struct CurrentState {
         BTreeMap<IntegrationCandidateId, crate::core::sleep::IntegrationCandidate>,
     #[serde(default)]
     pub sleep_cursor: u64,
+    #[serde(default)]
+    pub completion_criteria:
+        BTreeMap<CompletionCriterionId, crate::core::evidence::CompletionCriterion>,
+    #[serde(default)]
+    pub completion_claims: BTreeMap<CompletionClaimId, crate::core::evidence::CompletionClaim>,
     pub applied_events: Vec<EventId>,
 }
 
@@ -714,6 +721,8 @@ impl Default for CurrentState {
             sleep_runs: BTreeMap::new(),
             integration_candidates: BTreeMap::new(),
             sleep_cursor: 0,
+            completion_criteria: BTreeMap::new(),
+            completion_claims: BTreeMap::new(),
             applied_events: Vec::new(),
         }
     }

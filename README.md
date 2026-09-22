@@ -16,7 +16,7 @@ Run an interaction and keep its external message identity for deduplication:
 cargo run -- --thread-id thread-1 --message-id message-1 "What should we do next?"
 ```
 
-Useful commands are `--inspect`, `--identity`, `--positions`, `--conflicts`, `--pending`, and `--resume`. Memory candidates use `--memory-candidate TEXT`, `--memory-list`, `--promote-memory ID`, and `--reject-memory ID`.
+Useful commands are `--inspect`, `--identity`, `--positions`, `--conflicts`, `--pending`, `--resume`, `--completion-status TASK_ID`, and `--completion-claims`. Memory candidates use `--memory-candidate TEXT`, `--memory-list`, `--promote-memory ID`, and `--reject-memory ID`.
 
 Run one bounded background sleep pass with `--sleep-once`; inspect its cursor, active run, candidates, and projection verification with `--sleep-status`.
 

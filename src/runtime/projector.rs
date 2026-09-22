@@ -4,10 +4,11 @@ use serde::de::DeserializeOwned;
 use thiserror::Error;
 
 use crate::core::{
-    ActiveMemory, Approval, Attempt, CognitiveTrace, Commitment, Conflict, ConflictStatus,
-    CurrentState, Decision, EventKind, ExperienceEvent, Goal, IdentityVersion,
-    IntegrationCandidate, MemoryCandidate, Observation, Operation, Position, PositionStatus,
-    Principal, Receipt, Relationship, Run, SleepRun, SleepRunStatus, Task, Verification,
+    ActiveMemory, Approval, Attempt, CognitiveTrace, Commitment, CompletionClaim,
+    CompletionClaimTransition, CompletionCriterion, Conflict, ConflictStatus, CurrentState,
+    Decision, EventKind, EvidenceRef, ExperienceEvent, Goal, IdentityVersion, IntegrationCandidate,
+    MemoryCandidate, Observation, Operation, Position, PositionStatus, Principal, Receipt,
+    Relationship, Run, SleepRun, SleepRunStatus, Task, Verification, VerificationDisposition,
     VerificationStatus, WorkingState,
 };
 use crate::ports::{Storage, StorageError};
@@ -151,6 +152,61 @@ impl Projector {
             }
             EventKind::ArtifactCreated => {
                 insert(&event.event_kind, &event.payload, &mut state.artifacts)?
+            }
+            EventKind::CompletionCriterionDefined => {
+                let mut criterion: CompletionCriterion = payload(event)?;
+                if criterion.description.trim().is_empty() {
+                    return invalid(&event.event_kind, "criterion description cannot be empty");
+                }
+                if !state.tasks.contains_key(&criterion.task_id) {
+                    return invalid(&event.event_kind, "criterion references an unknown task");
+                }
+                if state.completion_criteria.contains_key(&criterion.id) {
+                    return invalid(&event.event_kind, "criterion ID already exists");
+                }
+                let normalized = crate::core::normalize_description(&criterion.description);
+                if state.completion_criteria.values().any(|existing| {
+                    existing.task_id == criterion.task_id
+                        && crate::core::normalize_description(&existing.description) == normalized
+                }) {
+                    return invalid(
+                        &event.event_kind,
+                        "criterion description already exists for task",
+                    );
+                }
+                criterion.description = criterion.description.trim().to_owned();
+                state.completion_criteria.insert(criterion.id, criterion);
+            }
+            EventKind::CompletionClaimCreated => {
+                if is_model_actor(state, event.actor_id) {
+                    return invalid(&event.event_kind, "model cannot create completion claims");
+                }
+                let claim: CompletionClaim = payload(event)?;
+                apply_claim_created(state, claim, event.event_kind.clone())?;
+            }
+            EventKind::CompletionClaimVerified => {
+                if is_model_actor(state, event.actor_id) {
+                    return invalid(&event.event_kind, "model cannot verify completion claims");
+                }
+                let transition: CompletionClaimTransition = payload(event)?;
+                apply_claim_transition(
+                    state,
+                    transition,
+                    VerificationDisposition::Verified,
+                    event.event_kind.clone(),
+                )?;
+            }
+            EventKind::CompletionClaimRejected => {
+                if is_model_actor(state, event.actor_id) {
+                    return invalid(&event.event_kind, "model cannot reject completion claims");
+                }
+                let transition: CompletionClaimTransition = payload(event)?;
+                apply_claim_transition(
+                    state,
+                    transition,
+                    VerificationDisposition::Rejected,
+                    event.event_kind.clone(),
+                )?;
             }
             EventKind::ApprovalRequested | EventKind::ApprovalResolved => {
                 insert(&event.event_kind, &event.payload, &mut state.approvals)?
@@ -436,3 +492,173 @@ keyed!(Verification, crate::core::VerificationId, id);
 keyed!(MemoryCandidate, crate::core::MemoryCandidateId, id);
 keyed!(ActiveMemory, crate::core::MemoryId, id);
 keyed!(crate::core::Artifact, crate::core::ArtifactId, id);
+keyed!(CompletionCriterion, crate::core::CompletionCriterionId, id);
+keyed!(CompletionClaim, crate::core::CompletionClaimId, id);
+
+fn invalid<T>(event_kind: &EventKind, message: impl Into<String>) -> Result<T, ProjectionError> {
+    Err(ProjectionError::InvalidPayload {
+        event_kind: format!("{event_kind:?}"),
+        message: message.into(),
+    })
+}
+
+fn is_model_actor(state: &CurrentState, actor_id: crate::core::PrincipalId) -> bool {
+    state
+        .principals
+        .get(&actor_id)
+        .is_some_and(|principal| matches!(principal.kind, crate::core::PrincipalKind::Hekate))
+}
+
+fn apply_claim_created(
+    state: &mut CurrentState,
+    mut claim: CompletionClaim,
+    event_kind: EventKind,
+) -> Result<(), ProjectionError> {
+    if !state.tasks.contains_key(&claim.task_id) {
+        return invalid(&event_kind, "claim references an unknown task");
+    }
+    let Some(criterion) = state.completion_criteria.get(&claim.criterion_id) else {
+        return invalid(&event_kind, "claim references an unknown criterion");
+    };
+    if criterion.task_id != claim.task_id {
+        return invalid(&event_kind, "criterion does not belong to claim task");
+    }
+    if !matches!(claim.disposition, VerificationDisposition::NeedsValidation) {
+        return invalid(&event_kind, "new claims must require validation");
+    }
+    if claim.confidence > 100 {
+        return invalid(&event_kind, "claim confidence must be between 0 and 100");
+    }
+    if claim.as_of_sequence > state.revision {
+        return invalid(&event_kind, "claim as-of sequence is in the future");
+    }
+    claim.evidence_refs = crate::core::normalize_evidence_refs(claim.evidence_refs);
+    if claim.fingerprint
+        != crate::core::completion_fingerprint(
+            claim.task_id,
+            claim.criterion_id,
+            &claim.evidence_refs,
+        )
+    {
+        return invalid(&event_kind, "claim fingerprint does not match its evidence");
+    }
+    for evidence in &claim.evidence_refs {
+        validate_evidence_ref(state, evidence, claim.as_of_sequence, event_kind.clone())?;
+    }
+    if state.completion_claims.contains_key(&claim.id) {
+        return invalid(&event_kind, "claim ID already exists");
+    }
+    if state
+        .completion_claims
+        .values()
+        .any(|existing| existing.fingerprint == claim.fingerprint)
+    {
+        return invalid(&event_kind, "claim fingerprint already exists");
+    }
+    if let Some(previous_id) = claim.supersedes {
+        let Some(previous) = state.completion_claims.get(&previous_id) else {
+            return invalid(&event_kind, "claim supersedes an unknown claim");
+        };
+        if previous.task_id != claim.task_id || previous.criterion_id != claim.criterion_id {
+            return invalid(&event_kind, "claim supersedes a different task criterion");
+        }
+    }
+    state.completion_claims.insert(claim.id, claim);
+    Ok(())
+}
+
+fn apply_claim_transition(
+    state: &mut CurrentState,
+    transition: CompletionClaimTransition,
+    expected: VerificationDisposition,
+    event_kind: EventKind,
+) -> Result<(), ProjectionError> {
+    let Some(claim) = state.completion_claims.get_mut(&transition.claim_id) else {
+        return invalid(&event_kind, "transition references an unknown claim");
+    };
+    if claim.task_id != transition.task_id || claim.criterion_id != transition.criterion_id {
+        return invalid(
+            &event_kind,
+            "claim transition identity does not match claim",
+        );
+    }
+    if claim.disposition != transition.previous_disposition
+        || transition.previous_disposition != VerificationDisposition::NeedsValidation
+        || transition.disposition != expected
+    {
+        return invalid(&event_kind, "invalid claim disposition transition");
+    }
+    if transition.reason.trim().is_empty() {
+        return invalid(&event_kind, "claim transition reason cannot be empty");
+    }
+    let evidence_refs = crate::core::normalize_evidence_refs(transition.evidence_refs);
+    if evidence_refs != claim.evidence_refs {
+        return invalid(
+            &event_kind,
+            "claim transition evidence does not match claim",
+        );
+    }
+    if matches!(expected, VerificationDisposition::Verified) {
+        if claim.evidence_refs.is_empty() {
+            return invalid(&event_kind, "a claim needs evidence before verification");
+        }
+        if claim
+            .blocker
+            .as_deref()
+            .is_some_and(|blocker| !blocker.trim().is_empty())
+        {
+            return invalid(&event_kind, "a blocked claim cannot be verified");
+        }
+    }
+    claim.disposition = expected;
+    Ok(())
+}
+
+fn validate_evidence_ref(
+    state: &CurrentState,
+    evidence: &EvidenceRef,
+    claim_as_of_sequence: u64,
+    event_kind: EventKind,
+) -> Result<(), ProjectionError> {
+    if !crate::core::valid_sha256_hex(&evidence.source_hash) {
+        return invalid(
+            &event_kind,
+            "evidence source hash is not lowercase SHA-256 hex",
+        );
+    }
+    if evidence.as_of_sequence > claim_as_of_sequence {
+        return invalid(
+            &event_kind,
+            "evidence is newer than the claim as-of sequence",
+        );
+    }
+    let Some(event_sequence) = state
+        .applied_events
+        .iter()
+        .position(|event_id| event_id == &evidence.event_id)
+        .map(|index| index as u64 + 1)
+    else {
+        return invalid(&event_kind, "evidence references an unknown event");
+    };
+    if event_sequence > claim_as_of_sequence {
+        return invalid(
+            &event_kind,
+            "evidence event is newer than the claim as-of sequence",
+        );
+    }
+    if let Some(artifact_id) = evidence.artifact_id {
+        let Some(artifact) = state.artifacts.get(&artifact_id) else {
+            return invalid(&event_kind, "evidence references an unknown artifact");
+        };
+        if artifact.provenance_event_id != evidence.event_id {
+            return invalid(
+                &event_kind,
+                "artifact provenance event does not match evidence",
+            );
+        }
+        if artifact.content_hash != evidence.source_hash {
+            return invalid(&event_kind, "artifact source hash does not match evidence");
+        }
+    }
+    Ok(())
+}

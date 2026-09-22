@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::evidence::VerificationDisposition;
 use super::{
     CognitiveTrace, Conflict, EventId, IdentityVersion, IntegrationCandidateId, Observation,
     Position, Relationship, SleepRunId,
@@ -55,15 +56,6 @@ pub struct ContextBudgetReport {
     pub included_recall_count: usize,
     pub dropped_recall_count: usize,
     pub hard_limit_bytes: usize,
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum VerificationDisposition {
-    #[default]
-    NeedsValidation,
-    Verified,
-    Rejected,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

@@ -12,3 +12,5 @@
 - External messages with the same channel/message identity are processed once.
 - Sleep advances its observation cursor only in the same transaction as candidate and completion events; failed or interrupted runs leave it unchanged.
 - Sleep source and counterevidence IDs must be present in the bounded sleep context, and sleep candidates never project into Memory, Position, Identity, Conflict, Relationship, or Goal state.
+- Completion claims start at `needs_validation`; only an explicit non-model actor can move them to `verified` or `rejected`.
+- Verified completion claims require ledger/artifact provenance, a valid as-of sequence, and no blocker. Confidence never grants verification.
