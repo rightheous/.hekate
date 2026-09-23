@@ -282,6 +282,8 @@ async fn write_projection(
     state: &CurrentState,
 ) -> Result<(), StorageError> {
     for table in [
+        "integration_candidate_materializations",
+        "integration_candidate_verifications",
         "completion_claims",
         "completion_criteria",
         "principals",
@@ -609,6 +611,46 @@ async fn write_projection(
         .bind(&candidate.created_at)
         .bind(enum_text(&candidate.disposition))
         .bind(candidate.as_of_revision as i64)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|error| StorageError::Backend(error.to_string()))?;
+    }
+    for verification in state.integration_verifications.values() {
+        sqlx::query(
+            "INSERT INTO integration_candidate_verifications
+             (candidate_id, previous_disposition, disposition, actor_id, reason,
+              evidence_refs_json, as_of_revision, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(verification.candidate_id.to_string())
+        .bind(enum_text(&verification.previous_disposition))
+        .bind(enum_text(&verification.new_disposition))
+        .bind(verification.actor_id.to_string())
+        .bind(&verification.reason)
+        .bind(json_text(&verification.evidence_refs)?)
+        .bind(verification.as_of_revision as i64)
+        .bind(&verification.created_at)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|error| StorageError::Backend(error.to_string()))?;
+    }
+    for materialization in state.integration_materializations.values() {
+        sqlx::query(
+            "INSERT INTO integration_candidate_materializations
+             (candidate_id, memory_candidate_id, memory_id, source_event_ids_json,
+              counterevidence_event_ids_json, evidence_refs_json, fingerprint,
+              as_of_revision, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(materialization.candidate_id.to_string())
+        .bind(materialization.memory_candidate_id.to_string())
+        .bind(materialization.memory_id.to_string())
+        .bind(json_text(&materialization.source_event_ids)?)
+        .bind(json_text(&materialization.counterevidence_event_ids)?)
+        .bind(json_text(&materialization.evidence_refs)?)
+        .bind(&materialization.fingerprint)
+        .bind(materialization.as_of_revision as i64)
+        .bind(&materialization.created_at)
         .execute(&mut **transaction)
         .await
         .map_err(|error| StorageError::Backend(error.to_string()))?;

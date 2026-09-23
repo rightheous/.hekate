@@ -1,6 +1,7 @@
 pub mod embedding;
 pub mod event;
 pub mod evidence;
+pub mod integration;
 pub mod model;
 pub mod recall;
 pub mod response_profile;
@@ -18,6 +19,7 @@ pub use evidence::{
     valid_sha256_hex, CompletionClaim, CompletionClaimTransition, CompletionCriterion, EvidenceRef,
     VerificationDisposition,
 };
+pub use integration::{IntegrationMaterialization, IntegrationVerification};
 pub use model::{
     now, ActionIntent, ActionIntentId, ActionProposal, ActiveMemory, ActiveMemoryStatus, Approval,
     ApprovalId, ApprovalStatus, Artifact, ArtifactId, Attempt, AttemptId, AttemptStatus,

@@ -12,11 +12,12 @@ use crate::core::{
     Attempt, AttemptStatus, CognitiveTrace, CompletionClaim, CompletionClaimId,
     CompletionCriterion, CompletionCriterionId, ConflictStatus, CurrentState, DecisionKind,
     EvidenceRef, Focus, Goal, GoalId, GoalStatus, IdentityVersion, IdentityVersionId,
-    InteractionResult, MemoryCandidate, MemoryCandidateId, MemoryCandidateStatus, MemoryId,
-    MemoryKind, Observation, Operation, OperationId, OperationStatus, Position, PositionStatus,
-    Principal, PrincipalId, PrincipalKind, RecallBundle, RecallQuery, Receipt, ReceiptId,
-    Relationship, RelationshipId, ResponseRecord, Run, RunId, RunStatus, Task, TaskId, TaskStatus,
-    Verification, VerificationId, VerificationStatus, WorkingState, WorkingStateId,
+    IntegrationCandidateId, InteractionResult, MemoryCandidate, MemoryCandidateId,
+    MemoryCandidateStatus, MemoryId, MemoryKind, Observation, Operation, OperationId,
+    OperationStatus, Position, PositionStatus, Principal, PrincipalId, PrincipalKind, RecallBundle,
+    RecallQuery, Receipt, ReceiptId, Relationship, RelationshipId, ResponseRecord, Run, RunId,
+    RunStatus, Task, TaskId, TaskStatus, Verification, VerificationId, VerificationStatus,
+    WorkingState, WorkingStateId,
 };
 use crate::ports::{
     CapabilityCatalog, CapabilityError, CognitiveError, CognitiveModel, Policy, PolicyError,
@@ -29,6 +30,9 @@ use crate::runtime::deliberation::{
     decision_from_cycle, validate_judgment, JudgmentValidationError,
 };
 use crate::runtime::focus::resolve_focus;
+use crate::runtime::memory_integration::{
+    IntegrationCandidateInspection, IntegrationError, MemoryIntegration, MemoryIntegrationResult,
+};
 use crate::runtime::projector::{ProjectionError, Projector};
 use crate::runtime::recall::{SemanticRecall, DEFAULT_RECALL_LIMIT};
 use crate::runtime::recovery::{recover, RecoveryError, RecoveryReport};
@@ -72,6 +76,8 @@ pub enum EngineError {
     Recovery(#[from] RecoveryError),
     #[error(transparent)]
     Sleep(#[from] SleepRuntimeError),
+    #[error(transparent)]
+    Integration(#[from] IntegrationError),
 }
 
 pub struct Engine {
@@ -603,6 +609,78 @@ impl Engine {
 
     pub async fn sleep_status(&self) -> Result<SleepStatus, EngineError> {
         Ok(crate::runtime::sleep::sleep_status(self.storage.as_ref()).await?)
+    }
+
+    pub async fn list_integration_candidates(
+        &self,
+    ) -> Result<Vec<IntegrationCandidateInspection>, EngineError> {
+        Ok(MemoryIntegration::new(self.storage.clone()).list().await?)
+    }
+
+    pub async fn inspect_integration_candidate(
+        &self,
+        candidate_id: IntegrationCandidateId,
+    ) -> Result<IntegrationCandidateInspection, EngineError> {
+        Ok(MemoryIntegration::new(self.storage.clone())
+            .inspect(candidate_id)
+            .await?)
+    }
+
+    pub async fn verify_integration_candidate(
+        &self,
+        candidate_id: IntegrationCandidateId,
+        actor_id: PrincipalId,
+        reason: impl Into<String>,
+    ) -> Result<crate::core::IntegrationCandidate, EngineError> {
+        Ok(MemoryIntegration::new(self.storage.clone())
+            .verify_candidate(candidate_id, actor_id, reason)
+            .await?)
+    }
+
+    pub async fn verify_integration_candidate_with_evidence(
+        &self,
+        candidate_id: IntegrationCandidateId,
+        actor_id: PrincipalId,
+        reason: impl Into<String>,
+        evidence_refs: Vec<EvidenceRef>,
+    ) -> Result<crate::core::IntegrationCandidate, EngineError> {
+        Ok(MemoryIntegration::new(self.storage.clone())
+            .verify_candidate_with_evidence(candidate_id, actor_id, reason, evidence_refs)
+            .await?)
+    }
+
+    pub async fn reject_integration_candidate(
+        &self,
+        candidate_id: IntegrationCandidateId,
+        actor_id: PrincipalId,
+        reason: impl Into<String>,
+    ) -> Result<crate::core::IntegrationCandidate, EngineError> {
+        Ok(MemoryIntegration::new(self.storage.clone())
+            .reject_candidate(candidate_id, actor_id, reason)
+            .await?)
+    }
+
+    pub async fn reject_integration_candidate_with_evidence(
+        &self,
+        candidate_id: IntegrationCandidateId,
+        actor_id: PrincipalId,
+        reason: impl Into<String>,
+        evidence_refs: Vec<EvidenceRef>,
+    ) -> Result<crate::core::IntegrationCandidate, EngineError> {
+        Ok(MemoryIntegration::new(self.storage.clone())
+            .reject_candidate_with_evidence(candidate_id, actor_id, reason, evidence_refs)
+            .await?)
+    }
+
+    pub async fn integrate_memory(
+        &self,
+        candidate_id: IntegrationCandidateId,
+    ) -> Result<MemoryIntegrationResult, EngineError> {
+        let commit = MemoryIntegration::new(self.storage.clone())
+            .materialize_memory(candidate_id, self.user_id)
+            .await?;
+        self.index_best_effort(&commit.state, &commit.events).await;
+        Ok(commit.result)
     }
 
     pub fn completion_gate(&self) -> CompletionGate {

@@ -73,6 +73,16 @@ pub struct Cli {
     #[arg(long)]
     pub sleep_status: bool,
     #[arg(long)]
+    pub integration_candidates: bool,
+    #[arg(long, value_name = "CANDIDATE_ID")]
+    pub verify_integration: Option<String>,
+    #[arg(long, value_name = "CANDIDATE_ID")]
+    pub reject_integration: Option<String>,
+    #[arg(long, value_name = "CANDIDATE_ID")]
+    pub integrate_memory: Option<String>,
+    #[arg(long)]
+    pub integration_reason: Option<String>,
+    #[arg(long)]
     pub memory_candidate: Option<String>,
     #[arg(long)]
     pub memory_kind: Option<String>,
@@ -101,6 +111,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         validate_chat_args(&cli)?;
     }
     validate_sleep_args(&cli)?;
+    validate_integration_args(&cli)?;
     validate_completion_args(&cli)?;
     let mut config = Config::load(cli.config.as_deref())?;
     if let Some(database_url) = cli.database_url.clone() {
@@ -149,6 +160,39 @@ fn validate_sleep_args(cli: &Cli) -> anyhow::Result<()> {
     }
     if cli.sleep_once && cli.sleep_status {
         anyhow::bail!("--sleep-once cannot be combined with --sleep-status");
+    }
+    Ok(())
+}
+
+fn validate_integration_args(cli: &Cli) -> anyhow::Result<()> {
+    let selected = [
+        cli.integration_candidates,
+        cli.verify_integration.is_some(),
+        cli.reject_integration.is_some(),
+        cli.integrate_memory.is_some(),
+    ]
+    .into_iter()
+    .filter(|selected| *selected)
+    .count();
+    if selected > 1 {
+        anyhow::bail!("integration commands cannot be combined")
+    }
+    if selected > 0 && (cli.chat || cli.response_profile) {
+        anyhow::bail!("integration commands cannot be combined with --chat or --response-profile")
+    }
+    if selected > 0 && !cli.message.is_empty() {
+        anyhow::bail!("integration commands cannot be combined with MESSAGE")
+    }
+    if cli.integration_reason.is_some()
+        && cli.verify_integration.is_none()
+        && cli.reject_integration.is_none()
+    {
+        anyhow::bail!("--integration-reason requires --verify-integration or --reject-integration")
+    }
+    if (cli.verify_integration.is_some() || cli.reject_integration.is_some())
+        && cli.integration_reason.is_none()
+    {
+        anyhow::bail!("verification and rejection require --integration-reason")
     }
     Ok(())
 }
@@ -398,6 +442,58 @@ async fn run_embedding_command(config: &Config, cli: &Cli) -> anyhow::Result<()>
 }
 
 async fn run_command(engine: &Engine, cli: &Cli) -> anyhow::Result<()> {
+    if cli.integration_candidates {
+        let candidates = engine
+            .list_integration_candidates()
+            .await?
+            .into_iter()
+            .map(|item| {
+                serde_json::json!({
+                    "candidate_id": item.candidate.id,
+                    "kind": item.candidate.kind,
+                    "disposition": item.candidate.disposition,
+                    "confidence": item.candidate.confidence,
+                    "source_event_ids": item.candidate.source_event_ids,
+                    "counterevidence_event_ids": item.candidate.counterevidence_event_ids,
+                    "fingerprint": item.candidate.fingerprint,
+                    "as_of_revision": item.candidate.as_of_revision,
+                    "materialized_memory_id": item.materialization.map(|value| value.memory_id),
+                })
+            })
+            .collect::<Vec<_>>();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({"candidates": candidates}))?
+        );
+        return Ok(());
+    }
+    if let Some(id) = &cli.verify_integration {
+        let candidate = engine
+            .verify_integration_candidate(
+                parse_id(id)?,
+                engine.user_id(),
+                cli.integration_reason.as_deref().unwrap_or_default(),
+            )
+            .await?;
+        println!("{}", serde_json::to_string_pretty(&candidate)?);
+        return Ok(());
+    }
+    if let Some(id) = &cli.reject_integration {
+        let candidate = engine
+            .reject_integration_candidate(
+                parse_id(id)?,
+                engine.user_id(),
+                cli.integration_reason.as_deref().unwrap_or_default(),
+            )
+            .await?;
+        println!("{}", serde_json::to_string_pretty(&candidate)?);
+        return Ok(());
+    }
+    if let Some(id) = &cli.integrate_memory {
+        let result = engine.integrate_memory(parse_id(id)?).await?;
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
     if cli.sleep_once {
         println!(
             "{}",

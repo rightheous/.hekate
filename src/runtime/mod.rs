@@ -5,6 +5,7 @@ pub mod deliberation;
 pub mod embedding_indexer;
 pub mod engine;
 pub mod focus;
+pub mod memory_integration;
 pub mod projector;
 pub mod recall;
 pub mod recovery;
@@ -16,5 +17,8 @@ pub use completion::{
     CompletionStatusReport,
 };
 pub use engine::{Engine, EngineError};
+pub use memory_integration::{
+    IntegrationCandidateInspection, IntegrationError, MemoryIntegrationResult,
+};
 pub use projector::{ProjectionError, Projector};
 pub use sleep::{SleepOnceResult, SleepOnceStatus, SleepStatus};
