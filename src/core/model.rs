@@ -684,6 +684,12 @@ pub struct CurrentState {
     pub integration_candidates:
         BTreeMap<IntegrationCandidateId, crate::core::sleep::IntegrationCandidate>,
     #[serde(default)]
+    pub integration_verifications:
+        BTreeMap<IntegrationCandidateId, crate::core::IntegrationVerification>,
+    #[serde(default)]
+    pub integration_materializations:
+        BTreeMap<IntegrationCandidateId, crate::core::IntegrationMaterialization>,
+    #[serde(default)]
     pub sleep_cursor: u64,
     #[serde(default)]
     pub completion_criteria:
@@ -720,6 +726,8 @@ impl Default for CurrentState {
             verifications: BTreeMap::new(),
             sleep_runs: BTreeMap::new(),
             integration_candidates: BTreeMap::new(),
+            integration_verifications: BTreeMap::new(),
+            integration_materializations: BTreeMap::new(),
             sleep_cursor: 0,
             completion_criteria: BTreeMap::new(),
             completion_claims: BTreeMap::new(),

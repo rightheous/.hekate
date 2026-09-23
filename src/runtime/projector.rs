@@ -7,9 +7,9 @@ use crate::core::{
     ActiveMemory, Approval, Attempt, CognitiveTrace, Commitment, CompletionClaim,
     CompletionClaimTransition, CompletionCriterion, Conflict, ConflictStatus, CurrentState,
     Decision, EventKind, EvidenceRef, ExperienceEvent, Goal, IdentityVersion, IntegrationCandidate,
-    MemoryCandidate, Observation, Operation, Position, PositionStatus, Principal, Receipt,
-    Relationship, Run, SleepRun, SleepRunStatus, Task, Verification, VerificationDisposition,
-    VerificationStatus, WorkingState,
+    IntegrationMaterialization, IntegrationVerification, MemoryCandidate, Observation, Operation,
+    Position, PositionStatus, Principal, Receipt, Relationship, Run, SleepRun, SleepRunStatus,
+    Task, Verification, VerificationDisposition, VerificationStatus, WorkingState,
 };
 use crate::ports::{Storage, StorageError};
 
@@ -327,6 +327,15 @@ impl Projector {
                     });
                 }
                 state.integration_candidates.insert(candidate.id, candidate);
+            }
+            EventKind::IntegrationCandidateVerified => {
+                apply_integration_transition(state, event, VerificationDisposition::Verified)?
+            }
+            EventKind::IntegrationCandidateRejected => {
+                apply_integration_transition(state, event, VerificationDisposition::Rejected)?
+            }
+            EventKind::IntegrationCandidateMaterialized => {
+                apply_integration_materialization(state, event)?
             }
             EventKind::ResponseProduced | EventKind::StateChanged => {}
         }
@@ -658,6 +667,256 @@ fn validate_evidence_ref(
         }
         if artifact.content_hash != evidence.source_hash {
             return invalid(&event_kind, "artifact source hash does not match evidence");
+        }
+    }
+    Ok(())
+}
+
+fn apply_integration_transition(
+    state: &mut CurrentState,
+    event: &ExperienceEvent,
+    expected: VerificationDisposition,
+) -> Result<(), ProjectionError> {
+    let verification: IntegrationVerification = payload(event)?;
+    let error = |message: &str| ProjectionError::InvalidPayload {
+        event_kind: format!("{:?}", event.event_kind),
+        message: message.to_owned(),
+    };
+    if event.subject.as_ref().map(|subject| {
+        subject.kind != crate::core::EntityKind::IntegrationCandidate
+            || subject.id != verification.candidate_id.uuid()
+    }) != Some(false)
+    {
+        return Err(error(
+            "integration verification subject does not match candidate",
+        ));
+    }
+    if event.actor_id != verification.actor_id {
+        return Err(error(
+            "integration verification actor does not match event actor",
+        ));
+    }
+    if state
+        .principals
+        .get(&verification.actor_id)
+        .map(|principal| matches!(principal.kind, crate::core::PrincipalKind::Hekate))
+        .unwrap_or(true)
+    {
+        return Err(error(
+            "integration verification actor is not an eligible principal",
+        ));
+    }
+    let Some(candidate) = state
+        .integration_candidates
+        .get(&verification.candidate_id)
+        .cloned()
+    else {
+        return Err(error(
+            "integration verification references an unknown candidate",
+        ));
+    };
+    if candidate.disposition != verification.previous_disposition
+        || verification.previous_disposition != VerificationDisposition::NeedsValidation
+        || verification.new_disposition != expected
+    {
+        return Err(error(
+            "invalid integration candidate disposition transition",
+        ));
+    }
+    if verification.reason.trim().is_empty() {
+        return Err(error("integration verification reason cannot be empty"));
+    }
+    if verification.as_of_revision != candidate.as_of_revision
+        || verification.as_of_revision > state.revision
+    {
+        return Err(error(
+            "integration verification has an invalid as-of revision",
+        ));
+    }
+    if crate::core::integration_candidate_fingerprint(
+        &candidate.kind,
+        &candidate.content,
+        &candidate.source_event_ids,
+        &candidate.counterevidence_event_ids,
+    ) != candidate.fingerprint
+    {
+        return Err(error("candidate fingerprint does not match its projection"));
+    }
+    let evidence_refs = crate::core::normalize_evidence_refs(verification.evidence_refs.clone());
+    if evidence_refs.is_empty() {
+        return Err(error("integration verification needs evidence"));
+    }
+    validate_integration_evidence(
+        state,
+        &candidate,
+        &evidence_refs,
+        verification.as_of_revision,
+        &error,
+    )?;
+    let candidate_id = candidate.id;
+    let Some(candidate) = state.integration_candidates.get_mut(&candidate_id) else {
+        return Err(error("integration candidate disappeared during transition"));
+    };
+    candidate.disposition = expected;
+    let mut stored = verification;
+    stored.reason = stored.reason.trim().to_owned();
+    stored.evidence_refs = evidence_refs;
+    state
+        .integration_verifications
+        .insert(stored.candidate_id, stored);
+    Ok(())
+}
+
+fn apply_integration_materialization(
+    state: &mut CurrentState,
+    event: &ExperienceEvent,
+) -> Result<(), ProjectionError> {
+    let materialization: IntegrationMaterialization = payload(event)?;
+    let error = |message: &str| ProjectionError::InvalidPayload {
+        event_kind: format!("{:?}", event.event_kind),
+        message: message.to_owned(),
+    };
+    if event.subject.as_ref().map(|subject| {
+        subject.kind != crate::core::EntityKind::IntegrationCandidate
+            || subject.id != materialization.candidate_id.uuid()
+    }) != Some(false)
+    {
+        return Err(error("materialization subject does not match candidate"));
+    }
+    let Some(candidate) = state
+        .integration_candidates
+        .get(&materialization.candidate_id)
+    else {
+        return Err(error("materialization references an unknown candidate"));
+    };
+    if candidate.disposition != VerificationDisposition::Verified {
+        return Err(error("only verified candidates can be materialized"));
+    }
+    if state
+        .integration_materializations
+        .contains_key(&materialization.candidate_id)
+    {
+        return Err(error("candidate has already been materialized"));
+    }
+    if crate::core::integration_candidate_fingerprint(
+        &candidate.kind,
+        &candidate.content,
+        &candidate.source_event_ids,
+        &candidate.counterevidence_event_ids,
+    ) != materialization.fingerprint
+    {
+        return Err(error(
+            "materialization fingerprint does not match candidate",
+        ));
+    }
+    if !matches!(
+        &candidate.kind,
+        crate::core::IntegrationCandidateKind::Memory
+    ) {
+        return Err(error("candidate kind cannot be materialized as Memory"));
+    }
+    if materialization.source_event_ids != candidate.source_event_ids
+        || materialization.counterevidence_event_ids != candidate.counterevidence_event_ids
+        || materialization.as_of_revision != candidate.as_of_revision
+    {
+        return Err(error("materialization provenance does not match candidate"));
+    }
+    let Some(verification) = state
+        .integration_verifications
+        .get(&materialization.candidate_id)
+    else {
+        return Err(error("materialization has no verification record"));
+    };
+    if verification.new_disposition != VerificationDisposition::Verified
+        || crate::core::normalize_evidence_refs(materialization.evidence_refs.clone())
+            != verification.evidence_refs
+    {
+        return Err(error(
+            "materialization evidence does not match verification",
+        ));
+    }
+    let Some(memory_candidate) = state
+        .memory_candidates
+        .get(&materialization.memory_candidate_id)
+    else {
+        return Err(error(
+            "materialization references an unknown Memory candidate",
+        ));
+    };
+    if memory_candidate.status != crate::core::MemoryCandidateStatus::Promoted
+        || memory_candidate.kind != crate::core::MemoryKind::Lesson
+        || memory_candidate.content != candidate.content
+        || memory_candidate.source_event_ids != candidate.source_event_ids
+    {
+        return Err(error("Memory candidate does not match materialization"));
+    }
+    let Some(memory) = state.active_memories.get(&materialization.memory_id) else {
+        return Err(error("materialization references an unknown Memory"));
+    };
+    if memory.status != crate::core::ActiveMemoryStatus::Active
+        || memory.candidate_id != materialization.memory_candidate_id
+    {
+        return Err(error("Memory does not match materialization"));
+    }
+    let evidence_refs = crate::core::normalize_evidence_refs(materialization.evidence_refs.clone());
+    validate_integration_evidence(
+        state,
+        candidate,
+        &evidence_refs,
+        materialization.as_of_revision,
+        &error,
+    )?;
+    let candidate_id = materialization.candidate_id;
+    let mut stored = materialization;
+    stored.evidence_refs = evidence_refs;
+    state
+        .integration_materializations
+        .insert(candidate_id, stored);
+    Ok(())
+}
+
+fn validate_integration_evidence(
+    state: &CurrentState,
+    candidate: &crate::core::IntegrationCandidate,
+    evidence_refs: &[EvidenceRef],
+    as_of_revision: u64,
+    error: &impl Fn(&str) -> ProjectionError,
+) -> Result<(), ProjectionError> {
+    for evidence in evidence_refs {
+        if !crate::core::valid_sha256_hex(&evidence.source_hash) {
+            return Err(error("evidence source hash is invalid"));
+        }
+        if evidence.as_of_sequence > as_of_revision {
+            return Err(error("evidence is newer than candidate as-of revision"));
+        }
+        if !candidate
+            .source_event_ids
+            .iter()
+            .chain(candidate.counterevidence_event_ids.iter())
+            .any(|event_id| event_id == &evidence.event_id)
+        {
+            return Err(error("evidence is outside candidate provenance"));
+        }
+        let Some(event_sequence) = state
+            .applied_events
+            .iter()
+            .position(|event_id| event_id == &evidence.event_id)
+            .map(|index| index as u64 + 1)
+        else {
+            return Err(error("evidence references an unknown event"));
+        };
+        if event_sequence > evidence.as_of_sequence || event_sequence > as_of_revision {
+            return Err(error("evidence event is newer than its as-of revision"));
+        }
+        if let Some(artifact_id) = evidence.artifact_id {
+            let Some(artifact) = state.artifacts.get(&artifact_id) else {
+                return Err(error("evidence references an unknown artifact"));
+            };
+            if artifact.provenance_event_id != evidence.event_id
+                || artifact.content_hash != evidence.source_hash
+            {
+                return Err(error("artifact evidence provenance does not match"));
+            }
         }
     }
     Ok(())
