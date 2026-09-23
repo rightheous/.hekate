@@ -298,6 +298,7 @@ fn failure_kind(error: &EngineError) -> &'static str {
         EngineError::Completion(_) => "completion_error",
         EngineError::Recovery(_) => "recovery_error",
         EngineError::Integration(_) => "integration_error",
+        EngineError::ContextBuilder(_) => "context_builder_error",
         EngineError::Sleep(error) => match error {
             SleepRuntimeError::Storage(_) => "storage_error",
             SleepRuntimeError::Projection(_) => "projection_error",

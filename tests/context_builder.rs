@@ -59,6 +59,7 @@ fn request(
 ) -> ContextBuildRequest {
     ContextBuildRequest {
         principal_id,
+        current_observation_id: None,
         relationship_id: None,
         task_id: None,
         run_id: None,

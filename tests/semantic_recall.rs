@@ -4,10 +4,11 @@ use async_trait::async_trait;
 use hekate::adapters::local_policy::LocalPolicy;
 use hekate::adapters::sqlite::{SqliteEmbeddingStore, SqliteStore};
 use hekate::core::{
-    now, CognitiveTrace, CommittedJudgment, DecisionKind, EmbeddingDocument, EmbeddingEntityKind,
-    EmbeddingSpace, EmbeddingVector, EntityKind, EntityRef, EventKind, EventSource,
-    ExperienceEvent, Observation, ObservationId, RecallQuery, SelfReview, ThoughtContext,
-    ThoughtCycle, ThoughtDraft,
+    now, ActiveMemory, ActiveMemoryStatus, CognitiveTrace, CommittedJudgment, DecisionKind,
+    EmbeddingDocument, EmbeddingEntityKind, EmbeddingSpace, EmbeddingVector, EntityKind, EntityRef,
+    EventKind, EventSource, ExperienceEvent, MemoryCandidate, MemoryCandidateId,
+    MemoryCandidateStatus, MemoryId, MemoryKind, Observation, ObservationId, RecallQuery,
+    SelfReview, ThoughtContext, ThoughtCycle, ThoughtDraft,
 };
 use hekate::ports::{
     CapabilityCatalog, CapabilityError, CapabilityResult, CognitiveError, CognitiveModel,
@@ -226,6 +227,87 @@ fn engine(store: Arc<SqliteStore>, model: RecordingModel, recall: Arc<SemanticRe
     .with_semantic_recall(recall)
 }
 
+async fn add_language_preference(
+    store: Arc<SqliteStore>,
+    principal_id: hekate::core::PrincipalId,
+    language: &str,
+) -> Result<(ActiveMemory, hekate::core::EventId), Box<dyn std::error::Error>> {
+    let source = ExperienceEvent::new(
+        principal_id,
+        EventKind::StateChanged,
+        None,
+        serde_json::json!({"preference_source": true}),
+        EventSource::new("test", None),
+        None,
+        None,
+        Some(1.0),
+    )?;
+    let content = serde_json::json!({
+        "schema": "hekate.response_preference.v1",
+        "key": "language",
+        "value": language,
+    })
+    .to_string();
+    let candidate = MemoryCandidate {
+        id: MemoryCandidateId::new(),
+        kind: MemoryKind::ExplicitPreference,
+        content: content.clone(),
+        subject_principal_id: Some(principal_id),
+        status: MemoryCandidateStatus::Candidate,
+        confidence: 100,
+        source_event_ids: vec![source.event_id],
+        valid_from: None,
+        valid_until: None,
+        supersedes: None,
+        created_at: now(),
+    };
+    let memory = ActiveMemory {
+        id: MemoryId::new(),
+        candidate_id: candidate.id,
+        kind: MemoryKind::ExplicitPreference,
+        content,
+        subject_principal_id: Some(principal_id),
+        status: ActiveMemoryStatus::Active,
+        confidence: 100,
+        source_event_ids: candidate.source_event_ids.clone(),
+        valid_from: None,
+        valid_until: None,
+        supersedes: None,
+        last_verified_at: None,
+        created_at: now(),
+    };
+    let projector = Projector::new(store);
+    projector.record(source.clone()).await?;
+    projector
+        .record(ExperienceEvent::new(
+            principal_id,
+            EventKind::MemoryCandidateCreated,
+            Some(EntityRef::new(
+                EntityKind::MemoryCandidate,
+                candidate.id.uuid(),
+            )),
+            serde_json::to_value(&candidate)?,
+            EventSource::new("test", None),
+            None,
+            None,
+            Some(1.0),
+        )?)
+        .await?;
+    projector
+        .record(ExperienceEvent::new(
+            principal_id,
+            EventKind::MemoryPromoted,
+            Some(EntityRef::new(EntityKind::Memory, memory.id.uuid())),
+            serde_json::to_value(&memory)?,
+            EventSource::new("test", None),
+            None,
+            None,
+            Some(1.0),
+        )?)
+        .await?;
+    Ok((memory, source.event_id))
+}
+
 #[tokio::test]
 async fn interaction_injects_recalled_provenance_and_excludes_current_observation(
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -236,6 +318,20 @@ async fn interaction_injects_recalled_provenance_and_excludes_current_observatio
     Projector::new(store.clone())
         .record(old_event.clone())
         .await?;
+    for _ in 0..20 {
+        Projector::new(store.clone())
+            .record(ExperienceEvent::new(
+                old.actor_id,
+                EventKind::StateChanged,
+                None,
+                serde_json::Value::Null,
+                EventSource::new("test", None),
+                None,
+                None,
+                Some(1.0),
+            )?)
+            .await?;
+    }
 
     let embedding_store = Arc::new(SqliteEmbeddingStore::open(&url).await?);
     let provider = TestProvider {
@@ -262,6 +358,11 @@ async fn interaction_injects_recalled_provenance_and_excludes_current_observatio
         .store_embeddings(&space(), &[duplicate], &[vector()])
         .await?;
 
+    let config = hekate::config::Config::default();
+    let (user_preference, user_preference_source) =
+        add_language_preference(store.clone(), config.user_principal_id, "ko-KR").await?;
+    add_language_preference(store.clone(), config.hekate_principal_id, "fr-FR").await?;
+
     let recall = Arc::new(SemanticRecall::new(indexer));
     let seen = Arc::new(Mutex::new(Vec::new()));
     let result = engine(
@@ -272,7 +373,9 @@ async fn interaction_injects_recalled_provenance_and_excludes_current_observatio
         },
         recall.clone(),
     )
-    .handle(observation("we decided to keep the migration small"))
+    .handle(observation(
+        "the current request is to inspect foreground context",
+    ))
     .await?;
 
     let context = seen
@@ -281,15 +384,64 @@ async fn interaction_injects_recalled_provenance_and_excludes_current_observatio
         .last()
         .cloned()
         .expect("captured thought context");
+    let snapshot = context
+        .context_snapshot
+        .as_ref()
+        .expect("bounded context snapshot attached to thought context");
+    assert_eq!(context.observation.id, result.observation_id);
+    assert_eq!(
+        snapshot["response_profile"]["as_of_revision"].as_u64(),
+        snapshot["as_of_revision"].as_u64()
+    );
+    assert!(snapshot["anchors"]
+        .as_array()
+        .expect("anchor items")
+        .iter()
+        .any(|item| item["kind"] == "identity"));
+    assert_eq!(snapshot["response_profile"]["language"], "ko-KR");
+    assert!(snapshot["response_profile"]["evidence"]
+        .as_array()
+        .expect("profile evidence")
+        .iter()
+        .any(|evidence| {
+            evidence["memory_id"] == user_preference.id.to_string()
+                && evidence["source_event_id"] == user_preference_source.to_string()
+        }));
+    let middle = snapshot["compressed_middle"]
+        .as_array()
+        .expect("compressed middle items");
+    let active_preference = middle
+        .iter()
+        .find(|item| item["entity"]["id"] == user_preference.id.uuid().to_string())
+        .expect("selected active preference memory");
+    assert!(active_preference["source_event_ids"]
+        .as_array()
+        .expect("memory provenance")
+        .contains(&serde_json::json!(user_preference_source)));
+    let active_recent = snapshot["active_recent"]
+        .as_array()
+        .expect("active recent items");
+    assert!(active_recent.iter().any(|item| {
+        item["kind"] == "recall"
+            && item["source_event_ids"]
+                .as_array()
+                .is_some_and(|sources| sources.contains(&serde_json::json!(old_event.event_id)))
+            && item["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("[untrusted historical evidence] "))
+    }));
+    assert!(!active_recent.iter().any(|item| {
+        item["kind"] == "recent_observation"
+            && item["entity"]["id"] == result.observation_id.uuid().to_string()
+    }));
     assert_eq!(context.recall.items.len(), 1);
     assert_eq!(context.recall.items[0].source_event_id, old_event.event_id);
     assert_eq!(context.recall.items[0].text, old.content);
     assert_eq!(result.decision.evidence_refs, vec![old_event.event_id]);
 
-    let current = store
-        .events()
-        .await?
-        .into_iter()
+    let events = store.events().await?;
+    let current = events
+        .iter()
         .find(|event| {
             event.subject.as_ref().is_some_and(|subject| {
                 subject.kind == EntityKind::Observation
@@ -297,6 +449,22 @@ async fn interaction_injects_recalled_provenance_and_excludes_current_observatio
             })
         })
         .expect("current observation event");
+    let current_sequence = events
+        .iter()
+        .position(|event| event.event_id == current.event_id)
+        .expect("current observation sequence")
+        + 1;
+    assert_eq!(
+        snapshot["as_of_revision"].as_u64(),
+        Some(current_sequence as u64)
+    );
+    assert!(context.event_sequence >= current_sequence as u64);
+    assert!(!context.relevant_events.iter().any(|event| {
+        event.subject.as_ref().is_some_and(|subject| {
+            subject.kind == EntityKind::Observation && subject.id == result.observation_id.uuid()
+        })
+    }));
+    assert!(context.recent_event_ids.contains(&current.event_id));
     let current_bundle = recall
         .recall(
             &RecallQuery {

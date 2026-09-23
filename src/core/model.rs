@@ -790,6 +790,8 @@ pub struct ThoughtContext {
     pub artifacts: Vec<Artifact>,
     #[serde(default)]
     pub recall: RecallBundle,
+    #[serde(default)]
+    pub context_snapshot: Option<serde_json::Value>,
     pub recent_event_ids: Vec<EventId>,
     pub relevant_events: Vec<ExperienceEvent>,
     pub available_capabilities: Vec<String>,

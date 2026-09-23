@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use super::{
-    EntityRef, EventId, PrincipalId, RecallBundle, RelationshipId, ResponseProfile, RunId, TaskId,
+    EntityRef, EventId, ObservationId, PrincipalId, RecallBundle, RelationshipId, ResponseProfile,
+    RunId, TaskId,
 };
 
 pub const DEFAULT_CONTEXT_ANCHOR_BUDGET_BYTES: usize = 24 * 1024;
@@ -80,6 +81,8 @@ pub struct ContextSourceRef {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ContextBuildRequest {
     pub principal_id: PrincipalId,
+    #[serde(default)]
+    pub current_observation_id: Option<ObservationId>,
     pub relationship_id: Option<RelationshipId>,
     pub task_id: Option<TaskId>,
     pub run_id: Option<RunId>,

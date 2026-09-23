@@ -1271,6 +1271,7 @@ mod tests {
             pending_approvals: Vec::new(),
             artifacts: Vec::new(),
             recall: crate::core::RecallBundle::default(),
+            context_snapshot: None,
             recent_event_ids: vec![event_id],
             relevant_events: Vec::new(),
             available_capabilities: Vec::new(),

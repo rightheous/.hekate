@@ -10,14 +10,14 @@ use crate::core::transition::{transition_operation, transition_run, TransitionEr
 use crate::core::{
     ActiveMemory, ActiveMemoryStatus, Approval, ApprovalId, ApprovalStatus, Artifact, ArtifactId,
     Attempt, AttemptStatus, CognitiveTrace, CompletionClaim, CompletionClaimId,
-    CompletionCriterion, CompletionCriterionId, ConflictStatus, CurrentState, DecisionKind,
-    EvidenceRef, Focus, Goal, GoalId, GoalStatus, IdentityVersion, IdentityVersionId,
-    IntegrationCandidateId, InteractionResult, MemoryCandidate, MemoryCandidateId,
-    MemoryCandidateStatus, MemoryId, MemoryKind, Observation, Operation, OperationId,
-    OperationStatus, Position, PositionStatus, Principal, PrincipalId, PrincipalKind, RecallBundle,
-    RecallQuery, Receipt, ReceiptId, Relationship, RelationshipId, ResponseRecord, Run, RunId,
-    RunStatus, Task, TaskId, TaskStatus, Verification, VerificationId, VerificationStatus,
-    WorkingState, WorkingStateId,
+    CompletionCriterion, CompletionCriterionId, ConflictStatus, ContextBudget, ContextBuildRequest,
+    CurrentState, DecisionKind, EvidenceRef, Focus, Goal, GoalId, GoalStatus, IdentityVersion,
+    IdentityVersionId, IntegrationCandidateId, InteractionResult, MemoryCandidate,
+    MemoryCandidateId, MemoryCandidateStatus, MemoryId, MemoryKind, Observation, Operation,
+    OperationId, OperationStatus, Position, PositionStatus, Principal, PrincipalId, PrincipalKind,
+    RecallBundle, RecallQuery, Receipt, ReceiptId, Relationship, RelationshipId, ResponseRecord,
+    Run, RunId, RunStatus, Task, TaskId, TaskStatus, Verification, VerificationId,
+    VerificationStatus, WorkingState, WorkingStateId,
 };
 use crate::ports::{
     CapabilityCatalog, CapabilityError, CognitiveError, CognitiveModel, Policy, PolicyError,
@@ -26,6 +26,7 @@ use crate::ports::{
 use crate::runtime::completion::{
     CompletionError, CompletionGate, CompletionGateResult, CompletionStatusReport,
 };
+use crate::runtime::context_builder::{build_context_snapshot, ContextBuilderError};
 use crate::runtime::deliberation::{
     decision_from_cycle, validate_judgment, JudgmentValidationError,
 };
@@ -78,6 +79,8 @@ pub enum EngineError {
     Sleep(#[from] SleepRuntimeError),
     #[error(transparent)]
     Integration(#[from] IntegrationError),
+    #[error(transparent)]
+    ContextBuilder(#[from] ContextBuilderError),
 }
 
 pub struct Engine {
@@ -148,7 +151,7 @@ impl Engine {
                 "observation content cannot be empty".to_owned(),
             ));
         }
-        let mut state = self.storage.load_state().await?;
+        let state = self.storage.load_state().await?;
         if let Some(existing) = state.observations.values().find(|existing| {
             observation.message_id.is_some()
                 && existing.source_type == observation.source_type
@@ -190,14 +193,7 @@ impl Engine {
             Some(observation.id.to_string()),
             None,
         )?;
-        state = self.projector.record(observation_event.clone()).await?;
-
-        let mut focus = resolve_focus(&state, &observation);
-        if focus.run_id.is_none() {
-            let (next_state, next_focus) = self.create_focus(&observation).await?;
-            state = next_state;
-            focus = next_focus;
-        }
+        let mut state = self.projector.record(observation_event.clone()).await?;
 
         let events = self.storage.load_events().await?;
         let recall = self
@@ -208,14 +204,49 @@ impl Engine {
                 &events,
             )
             .await;
-        let context = crate::runtime::context::build_context_with_recall(
+        let mut focus = resolve_focus(&state, &observation);
+        let relationship_id = state.relationships.values().find_map(|relationship| {
+            (relationship.participants.contains(&self.user_id)
+                && relationship.participants.contains(&self.hekate_id))
+            .then_some(relationship.id)
+        });
+        let as_of_revision = state.revision;
+        let context_snapshot = build_context_snapshot(
+            &state,
+            &events,
+            ContextBuildRequest {
+                principal_id: self.user_id,
+                current_observation_id: Some(observation.id),
+                relationship_id,
+                task_id: focus.task_id,
+                run_id: focus.run_id,
+                as_of_revision,
+                recalled: recall.clone(),
+                budget: ContextBudget::default(),
+            },
+        )?;
+        if focus.run_id.is_none() {
+            let (next_state, next_focus) = self.create_focus(&observation).await?;
+            state = next_state;
+            focus = next_focus;
+        }
+        let context_events = self.storage.load_events().await?;
+        let context = crate::runtime::context::build_context_with_recall_and_snapshot(
             &state,
             &observation,
             &focus,
-            &events,
+            &context_events,
             self.capabilities.names(),
             recall,
+            Some(serde_json::to_value(context_snapshot)?),
         );
+        let latest_state = self.storage.load_state().await?;
+        if latest_state.revision != context.event_sequence {
+            return Err(EngineError::StaleContext {
+                expected: context.event_sequence,
+                actual: latest_state.revision,
+            });
+        }
         let cycle = match self.model.think(&context).await {
             Ok(cycle) => cycle,
             Err(error) => {

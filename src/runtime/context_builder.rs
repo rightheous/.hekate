@@ -607,6 +607,16 @@ fn build_active_recent(
                         .as_ref()
                         .is_some_and(|subject| focus_strings.contains(&subject.id.to_string())))
         })
+        .filter(|(_, event)| {
+            !request
+                .current_observation_id
+                .is_some_and(|observation_id| {
+                    event.subject.as_ref().is_some_and(|subject| {
+                        subject.kind == EntityKind::Observation
+                            && subject.id == observation_id.uuid()
+                    })
+                })
+        })
         .map(|(sequence, event)| (*sequence, event))
         .collect::<Vec<_>>();
     selected_events.sort_by(|left, right| {

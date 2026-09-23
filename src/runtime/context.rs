@@ -32,6 +32,26 @@ pub fn build_context_with_recall(
     available_capabilities: Vec<String>,
     recall: RecallBundle,
 ) -> ThoughtContext {
+    build_context_with_recall_and_snapshot(
+        state,
+        observation,
+        focus,
+        events,
+        available_capabilities,
+        recall,
+        None,
+    )
+}
+
+pub fn build_context_with_recall_and_snapshot(
+    state: &CurrentState,
+    observation: &Observation,
+    focus: &Focus,
+    events: &[ExperienceEvent],
+    available_capabilities: Vec<String>,
+    recall: RecallBundle,
+    context_snapshot: Option<serde_json::Value>,
+) -> ThoughtContext {
     let goal = focus.goal_id.and_then(|id| state.goals.get(&id)).cloned();
     let task = focus.task_id.and_then(|id| state.tasks.get(&id)).cloned();
     let run = focus.run_id.and_then(|id| state.runs.get(&id)).cloned();
@@ -100,10 +120,24 @@ pub fn build_context_with_recall(
         &conflicts,
         events,
     );
-    let recent_event_ids = relevant_events
+    let mut recent_event_ids = relevant_events
         .iter()
         .map(|event| event.event_id)
         .collect::<Vec<_>>();
+    if let Some(event_id) = events.iter().find_map(|event| {
+        event
+            .subject
+            .as_ref()
+            .filter(|subject| {
+                subject.kind == crate::core::EntityKind::Observation
+                    && subject.id == observation.id.uuid()
+            })
+            .map(|_| event.event_id)
+    }) {
+        if !recent_event_ids.contains(&event_id) {
+            recent_event_ids.push(event_id);
+        }
+    }
     let mut snapshot = ThoughtContext {
         event_sequence: state.revision,
         observation: observation.clone(),
@@ -145,6 +179,7 @@ pub fn build_context_with_recall(
             .collect(),
         artifacts: state.artifacts.values().cloned().collect(),
         recall,
+        context_snapshot,
         recent_event_ids,
         relevant_events,
         available_capabilities,
@@ -187,13 +222,16 @@ fn select_events(
         .iter()
         .enumerate()
         .filter(|(index, event)| {
-            *index >= recent_start
+            !event.subject.as_ref().is_some_and(|subject| {
+                subject.kind == crate::core::EntityKind::Observation
+                    && subject.id == observation.id.uuid()
+            }) && (*index >= recent_start
                 || event.correlation_id.as_deref() == Some(observation_id.as_str())
                 || event
                     .subject
                     .as_ref()
                     .map(|subject| subjects.contains(&subject.id))
-                    .unwrap_or(false)
+                    .unwrap_or(false))
         })
         .map(|(_, event)| event.clone())
         .collect()
