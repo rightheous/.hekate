@@ -1,6 +1,6 @@
-use crate::core::{ContextSnapshot, Position, Stance};
+use crate::core::{Position, Stance, ThoughtContext};
 
-pub fn opposing_position<'a>(context: &'a ContextSnapshot) -> Option<&'a Position> {
+pub fn opposing_position<'a>(context: &'a ThoughtContext) -> Option<&'a Position> {
     let content = context.observation.content.to_ascii_lowercase();
     context.positions.iter().find(|position| {
         if !matches!(position.stance, Stance::Oppose) {
