@@ -81,6 +81,8 @@ pub struct Cli {
     pub reject_integration: Option<String>,
     #[arg(long, value_name = "CANDIDATE_ID")]
     pub integrate_memory: Option<String>,
+    #[arg(long, value_name = "CANDIDATE_ID")]
+    pub integrate_position: Option<String>,
     #[arg(long)]
     pub integration_reason: Option<String>,
     #[arg(long)]
@@ -184,6 +186,7 @@ fn validate_integration_args(cli: &Cli) -> anyhow::Result<()> {
         cli.verify_integration.is_some(),
         cli.reject_integration.is_some(),
         cli.integrate_memory.is_some(),
+        cli.integrate_position.is_some(),
     ]
     .into_iter()
     .filter(|selected| *selected)
@@ -293,6 +296,9 @@ fn validate_sleep_worker_args(cli: &Cli) -> anyhow::Result<()> {
     }
     if cli.integrate_memory.is_some() {
         conflicts.push("--integrate-memory");
+    }
+    if cli.integrate_position.is_some() {
+        conflicts.push("--integrate-position");
     }
     if cli.integration_reason.is_some() {
         conflicts.push("--integration-reason");
@@ -597,7 +603,10 @@ async fn run_command(engine: &Engine, cli: &Cli) -> anyhow::Result<()> {
                     "counterevidence_event_ids": item.candidate.counterevidence_event_ids,
                     "fingerprint": item.candidate.fingerprint,
                     "as_of_revision": item.candidate.as_of_revision,
+                    "content": item.candidate.content,
+                    "rationale": item.candidate.rationale,
                     "materialized_memory_id": item.materialization.map(|value| value.memory_id),
+                    "materialized_position_id": item.position_materialization.map(|value| value.position_id),
                 })
             })
             .collect::<Vec<_>>();
@@ -631,6 +640,11 @@ async fn run_command(engine: &Engine, cli: &Cli) -> anyhow::Result<()> {
     }
     if let Some(id) = &cli.integrate_memory {
         let result = engine.integrate_memory(parse_id(id)?).await?;
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+    if let Some(id) = &cli.integrate_position {
+        let result = engine.integrate_position(parse_id(id)?).await?;
         println!("{}", serde_json::to_string_pretty(&result)?);
         return Ok(());
     }

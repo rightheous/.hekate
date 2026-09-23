@@ -25,6 +25,7 @@ pub use context_builder::{
 pub use engine::{Engine, EngineError};
 pub use memory_integration::{
     IntegrationCandidateInspection, IntegrationError, MemoryIntegrationResult,
+    PositionIntegrationResult,
 };
 pub use projector::{ProjectionError, Projector};
 pub use sleep::{SleepOnceResult, SleepOnceStatus, SleepStatus};

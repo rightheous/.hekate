@@ -153,7 +153,7 @@ fn validate_position(
     validate_position_revision(state, position)
 }
 
-fn validate_position_revision(
+pub(crate) fn validate_position_revision(
     state: &CurrentState,
     position: &Position,
 ) -> Result<(), JudgmentValidationError> {

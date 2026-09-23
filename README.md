@@ -18,6 +18,16 @@ cargo run -- --thread-id thread-1 --message-id message-1 "What should we do next
 
 Useful commands are `--inspect`, `--identity`, `--positions`, `--conflicts`, `--pending`, `--resume`, `--completion-status TASK_ID`, `--completion-claims`, and the read-only `--response-profile`. Memory candidates use `--memory-candidate TEXT`, `--memory-list`, `--promote-memory ID`, and `--reject-memory ID`.
 
+Review Sleep integration candidates, verify one with a human reason, then explicitly materialize a Position candidate:
+
+```bash
+cargo run -- --integration-candidates
+cargo run -- --verify-integration CANDIDATE_ID --integration-reason "Reviewed against its source"
+cargo run -- --integrate-position CANDIDATE_ID
+```
+
+Position candidate content uses the `hekate.position_integration.v1` JSON schema with an `establish`, `revise`, or `withdraw` operation. Revision and withdrawal proposals must reference an active HEKATE Position ID and its current version; user Positions are never modified. Verification and materialization remain separate human-triggered steps.
+
 Run one bounded background sleep pass with `--sleep-once`; inspect its cursor, active run, candidates, and projection verification with `--sleep-status`.
 
 `--response-profile` derives a principal-scoped profile from active explicit-preference Memory whose content matches the strict `hekate.response_preference.v1` JSON schema. The profile is not stored or injected into the model prompt; v1 supports principal scope only.

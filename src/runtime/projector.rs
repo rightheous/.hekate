@@ -8,10 +8,13 @@ use crate::core::{
     CompletionClaimTransition, CompletionCriterion, Conflict, ConflictStatus, CurrentState,
     Decision, EventKind, EvidenceRef, ExperienceEvent, Goal, IdentityVersion, IntegrationCandidate,
     IntegrationMaterialization, IntegrationVerification, MemoryCandidate, Observation, Operation,
-    Position, PositionStatus, Principal, Receipt, Relationship, Run, SleepRun, SleepRunStatus,
-    Task, Verification, VerificationDisposition, VerificationStatus, WorkingState,
+    Position, PositionIntegrationActionKind, PositionIntegrationEventPayload,
+    PositionIntegrationMaterialization, PositionIntegrationOperation, PositionIntegrationProposal,
+    PositionStatus, Principal, Receipt, Relationship, Run, SleepRun, SleepRunStatus, Task,
+    Verification, VerificationDisposition, VerificationStatus, WorkingState,
 };
 use crate::ports::{Storage, StorageError};
+use crate::runtime::deliberation::validate_position_revision;
 
 #[derive(Debug, Error)]
 pub enum ProjectionError {
@@ -112,22 +115,9 @@ impl Projector {
             }
             EventKind::PositionEstablished
             | EventKind::PositionMaintained
-            | EventKind::PositionRecorded => {
-                insert(&event.event_kind, &event.payload, &mut state.positions)?
-            }
-            EventKind::PositionRevised => {
-                let position: Position = payload(event)?;
-                if let Some(previous_id) = position.supersedes {
-                    if let Some(previous) = state.positions.get_mut(&previous_id) {
-                        previous.status = PositionStatus::Superseded;
-                    }
-                }
-                state.positions.insert(position.id, position);
-            }
-            EventKind::PositionRetracted => {
-                let position: Position = payload(event)?;
-                state.positions.insert(position.id, position);
-            }
+            | EventKind::PositionRecorded
+            | EventKind::PositionRevised
+            | EventKind::PositionRetracted => apply_position_event(state, event)?,
             EventKind::ConflictOpened | EventKind::ConflictRecorded => {
                 let conflict: Conflict = payload(event)?;
                 store_conflict(state, conflict);
@@ -342,6 +332,327 @@ impl Projector {
         state.revision += 1;
         state.applied_events.push(event.event_id);
         Ok(())
+    }
+}
+
+fn apply_position_event(
+    state: &mut CurrentState,
+    event: &ExperienceEvent,
+) -> Result<(), ProjectionError> {
+    if event.payload.get("position_integration").is_some() {
+        let integration_event: PositionIntegrationEventPayload = payload(event)?;
+        return apply_position_integration(state, event, integration_event);
+    }
+    let position: Position = payload(event)?;
+    match event.event_kind {
+        EventKind::PositionEstablished
+        | EventKind::PositionMaintained
+        | EventKind::PositionRecorded => {
+            state.positions.insert(position.id, position);
+            Ok(())
+        }
+        EventKind::PositionRevised => {
+            if let Some(previous_id) = position.supersedes {
+                if let Some(previous) = state.positions.get_mut(&previous_id) {
+                    previous.status = PositionStatus::Superseded;
+                }
+            }
+            state.positions.insert(position.id, position);
+            Ok(())
+        }
+        EventKind::PositionRetracted => {
+            state.positions.insert(position.id, position);
+            Ok(())
+        }
+        _ => invalid(&event.event_kind, "event is not a Position lifecycle event"),
+    }
+}
+
+fn apply_position_integration(
+    state: &mut CurrentState,
+    event: &ExperienceEvent,
+    integration_event: PositionIntegrationEventPayload,
+) -> Result<(), ProjectionError> {
+    let error = |message: &str| ProjectionError::InvalidPayload {
+        event_kind: format!("{:?}", event.event_kind),
+        message: message.to_owned(),
+    };
+    let position = integration_event.position;
+    let materialization = integration_event.position_integration;
+    let candidate_id = materialization.candidate_id.to_string();
+    if event.subject.as_ref().map(|subject| {
+        subject.kind != crate::core::EntityKind::Position || subject.id != position.id.uuid()
+    }) != Some(false)
+        || materialization.position_id != position.id
+        || materialization.position_event_id != event.event_id
+    {
+        return Err(error(
+            "Position integration event subject does not match payload",
+        ));
+    }
+    if event.source.source_type != "position_integration"
+        || event.source.source_ref.as_deref() != Some(candidate_id.as_str())
+        || event.correlation_id.as_deref() != Some(candidate_id.as_str())
+        || event.causation_id != Some(materialization.verification_event_id)
+    {
+        return Err(error(
+            "Position integration event provenance does not match candidate",
+        ));
+    }
+    if !state.principals.contains_key(&event.actor_id) || is_model_actor(state, event.actor_id) {
+        return Err(error(
+            "model or unknown actor cannot materialize a Position",
+        ));
+    }
+    let Some(principal) = state.principals.get(&position.principal_id) else {
+        return Err(error("Position references an unknown principal"));
+    };
+    if !matches!(principal.kind, crate::core::PrincipalKind::Hekate) {
+        return Err(error(
+            "Position integration can only change HEKATE's Position",
+        ));
+    }
+    let Some(candidate) = state
+        .integration_candidates
+        .get(&materialization.candidate_id)
+        .cloned()
+    else {
+        return Err(error(
+            "Position materialization references an unknown candidate",
+        ));
+    };
+    if !matches!(
+        candidate.kind,
+        crate::core::IntegrationCandidateKind::Position
+    ) || candidate.disposition != VerificationDisposition::Verified
+    {
+        return Err(error(
+            "only a verified Position candidate can be materialized",
+        ));
+    }
+    if state
+        .position_integration_materializations
+        .contains_key(&materialization.candidate_id)
+    {
+        return Err(error("Position candidate has already been materialized"));
+    }
+    let Some(verification) = state
+        .integration_verifications
+        .get(&materialization.candidate_id)
+    else {
+        return Err(error("Position materialization has no verification record"));
+    };
+    let evidence_refs = crate::core::normalize_evidence_refs(materialization.evidence_refs.clone());
+    if verification.new_disposition != VerificationDisposition::Verified
+        || evidence_refs != verification.evidence_refs
+        || !state
+            .applied_events
+            .contains(&materialization.verification_event_id)
+    {
+        return Err(error(
+            "Position materialization does not match verification",
+        ));
+    }
+    if materialization.fingerprint != candidate.fingerprint
+        || crate::core::integration_candidate_fingerprint(
+            &candidate.kind,
+            &candidate.content,
+            &candidate.source_event_ids,
+            &candidate.counterevidence_event_ids,
+        ) != candidate.fingerprint
+        || materialization.source_event_ids != candidate.source_event_ids
+        || materialization.counterevidence_event_ids != candidate.counterevidence_event_ids
+        || materialization.as_of_revision != candidate.as_of_revision
+        || candidate.as_of_revision > state.revision
+        || candidate
+            .source_event_ids
+            .iter()
+            .chain(candidate.counterevidence_event_ids.iter())
+            .any(|id| !state.applied_events.contains(id))
+    {
+        return Err(error(
+            "Position materialization provenance does not match candidate",
+        ));
+    }
+    validate_integration_evidence(
+        state,
+        &candidate,
+        &evidence_refs,
+        materialization.as_of_revision,
+        &error,
+    )?;
+    if !position_matches_proposal(&candidate, &position, &materialization) {
+        return Err(error("Position does not match its typed proposal"));
+    }
+    if position.confidence != candidate.confidence {
+        return Err(error("Position confidence does not match candidate"));
+    }
+    let prior_position = materialization.prior_position.as_ref();
+    match materialization.action {
+        PositionIntegrationActionKind::Establish => {
+            if prior_position.is_some()
+                || position.status != PositionStatus::Active
+                || position.version != 1
+                || position.supersedes.is_some()
+            {
+                return Err(error("invalid Position establishment"));
+            }
+        }
+        PositionIntegrationActionKind::Revise => {
+            let Some(prior) = prior_position else {
+                return Err(error("Position revision has no prior Position"));
+            };
+            if state.positions.get(&prior.id) != Some(prior)
+                || prior.status != PositionStatus::Active
+                || position.id == prior.id
+                || position.supersedes != Some(prior.id)
+                || position.principal_id != prior.principal_id
+                || position.subject != prior.subject
+                || prior.version.checked_add(1) != Some(position.version)
+                || position.status != PositionStatus::Active
+            {
+                return Err(error("Position changed or revision is invalid"));
+            }
+        }
+        PositionIntegrationActionKind::Withdraw => {
+            let Some(prior) = prior_position else {
+                return Err(error("Position withdrawal has no prior Position"));
+            };
+            if state.positions.get(&prior.id) != Some(prior)
+                || prior.status != PositionStatus::Active
+                || position.id != prior.id
+                || position.supersedes.is_some()
+                || position.status != PositionStatus::Retracted
+                || position.version != prior.version
+                || position.principal_id != prior.principal_id
+                || position.subject != prior.subject
+                || position.stance != prior.stance
+            {
+                return Err(error("Position changed or withdrawal is invalid"));
+            }
+        }
+    }
+    let expected_kind = match materialization.action {
+        PositionIntegrationActionKind::Establish => EventKind::PositionEstablished,
+        PositionIntegrationActionKind::Revise => EventKind::PositionRevised,
+        PositionIntegrationActionKind::Withdraw => EventKind::PositionRetracted,
+    };
+    if event.event_kind != expected_kind {
+        return Err(error(
+            "Position event kind does not match integration operation",
+        ));
+    }
+    let target_id = prior_position.map(|prior| prior.id);
+    if crate::core::position_integration_blocked(
+        state,
+        position.principal_id,
+        &position.subject,
+        target_id,
+    ) {
+        return Err(error("an active Position conflict blocks materialization"));
+    }
+    validate_position_revision(state, &position)
+        .map_err(|_| error("Position transition violates its lifecycle"))?;
+    if materialization.action != PositionIntegrationActionKind::Withdraw
+        && position.evidence_refs != candidate.source_event_ids
+    {
+        return Err(error("Position evidence does not match candidate sources"));
+    }
+    if materialization.action == PositionIntegrationActionKind::Withdraw
+        && candidate
+            .source_event_ids
+            .iter()
+            .any(|id| !position.evidence_refs.contains(id))
+    {
+        return Err(error("Position evidence omits candidate sources"));
+    }
+
+    if materialization.action == PositionIntegrationActionKind::Revise {
+        if let Some(prior_id) = position.supersedes {
+            if let Some(previous) = state.positions.get_mut(&prior_id) {
+                previous.status = PositionStatus::Superseded;
+            }
+        }
+    }
+    state.positions.insert(position.id, position);
+    state
+        .position_integration_materializations
+        .insert(materialization.candidate_id, materialization);
+    Ok(())
+}
+
+fn position_matches_proposal(
+    candidate: &IntegrationCandidate,
+    position: &Position,
+    materialization: &PositionIntegrationMaterialization,
+) -> bool {
+    let Ok(proposal) = PositionIntegrationProposal::parse(&candidate.content) else {
+        return false;
+    };
+    let trim = |values: &[String]| {
+        values
+            .iter()
+            .map(|value| value.trim().to_owned())
+            .collect::<Vec<_>>()
+    };
+    match (
+        &proposal.operation,
+        materialization.action,
+        materialization.prior_position.as_ref(),
+    ) {
+        (
+            PositionIntegrationOperation::Establish {
+                subject,
+                stance,
+                reasons,
+                reconsideration_conditions,
+            },
+            PositionIntegrationActionKind::Establish,
+            None,
+        ) => {
+            position.subject == subject.trim()
+                && position.stance == *stance
+                && position.reasons == trim(reasons)
+                && position.reconsideration_conditions == trim(reconsideration_conditions)
+        }
+        (
+            PositionIntegrationOperation::Revise {
+                position_id,
+                expected_version,
+                stance,
+                reasons,
+                reconsideration_conditions,
+            },
+            PositionIntegrationActionKind::Revise,
+            Some(prior),
+        ) => {
+            *position_id == prior.id
+                && *expected_version == prior.version
+                && position.subject == prior.subject
+                && position.stance == *stance
+                && position.reasons == trim(reasons)
+                && position.reconsideration_conditions == trim(reconsideration_conditions)
+        }
+        (
+            PositionIntegrationOperation::Withdraw {
+                position_id,
+                expected_version,
+                reason,
+            },
+            PositionIntegrationActionKind::Withdraw,
+            Some(prior),
+        ) => {
+            let mut expected = prior.clone();
+            expected.status = PositionStatus::Retracted;
+            expected.reasons.push(reason.trim().to_owned());
+            expected
+                .evidence_refs
+                .extend(materialization.source_event_ids.iter().copied());
+            expected.evidence_refs.sort();
+            expected.evidence_refs.dedup();
+            *position_id == prior.id && *expected_version == prior.version && *position == expected
+        }
+        _ => false,
     }
 }
 
@@ -741,6 +1052,15 @@ fn apply_integration_transition(
     ) != candidate.fingerprint
     {
         return Err(error("candidate fingerprint does not match its projection"));
+    }
+    if expected == VerificationDisposition::Verified
+        && matches!(
+            &candidate.kind,
+            crate::core::IntegrationCandidateKind::Position
+        )
+    {
+        PositionIntegrationProposal::parse(&candidate.content)
+            .map_err(|_| error("Position candidate has an invalid typed proposal"))?;
     }
     let evidence_refs = crate::core::normalize_evidence_refs(verification.evidence_refs.clone());
     if evidence_refs.is_empty() {

@@ -33,6 +33,7 @@ use crate::runtime::deliberation::{
 use crate::runtime::focus::resolve_focus;
 use crate::runtime::memory_integration::{
     IntegrationCandidateInspection, IntegrationError, MemoryIntegration, MemoryIntegrationResult,
+    PositionIntegrationResult,
 };
 use crate::runtime::projector::{ProjectionError, Projector};
 use crate::runtime::recall::{SemanticRecall, DEFAULT_RECALL_LIMIT};
@@ -709,6 +710,17 @@ impl Engine {
     ) -> Result<MemoryIntegrationResult, EngineError> {
         let commit = MemoryIntegration::new(self.storage.clone())
             .materialize_memory(candidate_id, self.user_id)
+            .await?;
+        self.index_best_effort(&commit.state, &commit.events).await;
+        Ok(commit.result)
+    }
+
+    pub async fn integrate_position(
+        &self,
+        candidate_id: IntegrationCandidateId,
+    ) -> Result<PositionIntegrationResult, EngineError> {
+        let commit = MemoryIntegration::new(self.storage.clone())
+            .materialize_position(candidate_id, self.hekate_id, self.user_id)
             .await?;
         self.index_best_effort(&commit.state, &commit.events).await;
         Ok(commit.result)

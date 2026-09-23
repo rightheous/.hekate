@@ -7,8 +7,8 @@ use hekate::config::Config;
 use hekate::core::{
     now, CognitiveTrace, EmbeddingDocument, EmbeddingSpace, EntityKind, EntityRef, EventKind,
     EventSource, EvidenceRef, ExperienceEvent, IntegrationCandidate, IntegrationCandidateId,
-    IntegrationCandidateKind, Observation, ObservationId, Principal, PrincipalKind, SleepRun,
-    SleepRunId, SleepRunStatus, VerificationDisposition,
+    IntegrationCandidateKind, Observation, ObservationId, PositionStatus, Principal, PrincipalKind,
+    SleepRun, SleepRunId, SleepRunStatus, VerificationDisposition,
 };
 use hekate::ports::{
     CapabilityCatalog, CapabilityError, CapabilityResult, CognitiveError, CognitiveModel,
@@ -238,7 +238,10 @@ async fn fixture() -> Result<
         }
     };
     let memory_candidate = make_candidate(IntegrationCandidateKind::Memory, "durable memory");
-    let position_candidate = make_candidate(IntegrationCandidateKind::Position, "durable position");
+    let position_candidate = make_candidate(
+        IntegrationCandidateKind::Position,
+        r#"{"schema":"hekate.position_integration.v1","operation":{"action":"establish","subject":"durable position","stance":"support","reasons":["supported by source"],"reconsideration_conditions":["new contrary evidence"]}}"#,
+    );
     for candidate in [&memory_candidate, &position_candidate] {
         projector
             .record(event(
@@ -270,6 +273,85 @@ async fn fixture() -> Result<
         position_candidate.id,
         observation_event.event_id,
     ))
+}
+
+async fn position_candidate(
+    store: &SqliteStore,
+    actor_id: hekate::core::PrincipalId,
+    source_event_id: hekate::core::EventId,
+    content: String,
+) -> Result<IntegrationCandidateId, Box<dyn std::error::Error>> {
+    let projector = Projector::new(Arc::new(store.clone()));
+    let state = store.state().await?;
+    let high_water_revision = state.revision;
+    let run = SleepRun {
+        id: SleepRunId::new(),
+        status: SleepRunStatus::Running,
+        high_water_revision,
+        cursor_before: state.sleep_cursor,
+        cursor_after: None,
+        seed_event_ids: vec![source_event_id],
+        processed_observation_count: 1,
+        created_candidate_count: 0,
+        started_at: now(),
+        finished_at: None,
+        error_kind: None,
+        context_budget_report: None,
+    };
+    projector
+        .record(event(
+            actor_id,
+            EventKind::SleepRunStarted,
+            EntityKind::SleepRun,
+            run.id.uuid(),
+            &run,
+        ))
+        .await?;
+    let kind = IntegrationCandidateKind::Position;
+    let source_event_ids = vec![source_event_id];
+    let candidate = IntegrationCandidate {
+        id: IntegrationCandidateId::new(),
+        sleep_run_id: run.id,
+        kind: kind.clone(),
+        disposition: VerificationDisposition::NeedsValidation,
+        as_of_revision: high_water_revision,
+        fingerprint: hekate::core::integration_candidate_fingerprint(
+            &kind,
+            &content,
+            &source_event_ids,
+            &[],
+        ),
+        content,
+        rationale: "source supports this revision".to_owned(),
+        source_event_ids,
+        counterevidence_event_ids: Vec::new(),
+        confidence: 100,
+        created_at: now(),
+    };
+    projector
+        .record(event(
+            actor_id,
+            EventKind::IntegrationCandidateCreated,
+            EntityKind::IntegrationCandidate,
+            candidate.id.uuid(),
+            &candidate,
+        ))
+        .await?;
+    let mut completed = run;
+    completed.status = SleepRunStatus::Completed;
+    completed.cursor_after = Some(high_water_revision);
+    completed.created_candidate_count = 1;
+    completed.finished_at = Some(now());
+    projector
+        .record(event(
+            actor_id,
+            EventKind::SleepRunCompleted,
+            EntityKind::SleepRun,
+            completed.id.uuid(),
+            &completed,
+        ))
+        .await?;
+    Ok(candidate.id)
 }
 
 fn engine(store: Arc<SqliteStore>, recall: Option<Arc<SemanticRecall>>) -> Engine {
@@ -430,6 +512,202 @@ async fn rejects_bad_evidence_and_never_materializes_failed_transitions(
     assert!(state.memory_candidates.is_empty());
     assert!(state.active_memories.is_empty());
     assert_eq!(Projector::replay(&store.events().await?)?, state);
+    engine.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn position_integration_establishes_revises_withdraws_and_replays(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (store, _, candidate_id, source_event_id) = fixture().await?;
+    let config = Config::default();
+    let engine = engine(store.clone(), None);
+
+    assert!(matches!(
+        engine.integrate_position(candidate_id).await,
+        Err(EngineError::Integration(
+            IntegrationError::CandidateNotVerified(id)
+        )) if id == candidate_id
+    ));
+    let candidate = store.state().await?.integration_candidates[&candidate_id].clone();
+    let source_hash = store
+        .events()
+        .await?
+        .into_iter()
+        .find(|event| event.event_id == source_event_id)
+        .expect("Position source event")
+        .integrity_hash;
+    assert!(matches!(
+        engine
+            .verify_integration_candidate_with_evidence(
+                candidate_id,
+                config.user_principal_id,
+                "human checked",
+                vec![EvidenceRef {
+                    event_id: hekate::core::EventId::new(),
+                    artifact_id: None,
+                    source_hash,
+                    as_of_sequence: candidate.as_of_revision,
+                }],
+            )
+            .await,
+        Err(EngineError::Integration(
+            IntegrationError::EvidenceOutsideCandidate(_)
+        ))
+    ));
+    engine
+        .verify_integration_candidate(candidate_id, config.user_principal_id, "human checked")
+        .await?;
+    let established = engine.integrate_position(candidate_id).await?;
+    assert_eq!(
+        established.position.principal_id,
+        config.hekate_principal_id
+    );
+    assert_eq!(established.position.version, 1);
+    assert_eq!(established.position.status, PositionStatus::Active);
+    assert_eq!(
+        established.materialization.source_event_ids,
+        vec![source_event_id]
+    );
+    assert!(matches!(
+        engine.integrate_position(candidate_id).await,
+        Err(EngineError::Integration(
+            IntegrationError::PositionAlreadyMaterialized(id)
+        )) if id == candidate_id
+    ));
+
+    let revision_candidate = |stance: &str| {
+        serde_json::json!({
+            "schema": "hekate.position_integration.v1",
+            "operation": {
+                "action": "revise",
+                "position_id": established.position.id.to_string(),
+                "expected_version": 1,
+                "stance": stance,
+                "reasons": ["new evidence changed the assessment"],
+                "reconsideration_conditions": ["further source confirmation"]
+            }
+        })
+        .to_string()
+    };
+    let revised_id = position_candidate(
+        &store,
+        config.hekate_principal_id,
+        source_event_id,
+        revision_candidate("oppose"),
+    )
+    .await?;
+    let competing_revised_id = position_candidate(
+        &store,
+        config.hekate_principal_id,
+        source_event_id,
+        revision_candidate("uncertain"),
+    )
+    .await?;
+    engine
+        .verify_integration_candidate(revised_id, config.user_principal_id, "human checked")
+        .await?;
+    engine
+        .verify_integration_candidate(
+            competing_revised_id,
+            config.user_principal_id,
+            "human checked",
+        )
+        .await?;
+    let revised = engine.integrate_position(revised_id).await?;
+    assert!(matches!(
+        engine.integrate_position(competing_revised_id).await,
+        Err(EngineError::Integration(IntegrationError::PositionChanged(id)))
+            if id == established.position.id
+    ));
+    assert_eq!(revised.position.version, 2);
+    assert_eq!(revised.position.supersedes, Some(established.position.id));
+    assert_eq!(
+        store.state().await?.positions[&established.position.id].status,
+        PositionStatus::Superseded
+    );
+
+    let unsupported_withdraw_id = position_candidate(
+        &store,
+        config.hekate_principal_id,
+        source_event_id,
+        serde_json::json!({
+            "schema": "hekate.position_integration.v1",
+            "operation": {
+                "action": "withdraw",
+                "position_id": revised.position.id.to_string(),
+                "expected_version": 2,
+                "reason": "source was withdrawn"
+            }
+        })
+        .to_string(),
+    )
+    .await?;
+    assert!(matches!(
+        engine
+            .verify_integration_candidate(
+                unsupported_withdraw_id,
+                config.user_principal_id,
+                "human checked"
+            )
+            .await,
+        Err(EngineError::Integration(
+            IntegrationError::InvalidPositionTransition
+        ))
+    ));
+
+    let second_candidate_id = position_candidate(
+        &store,
+        config.hekate_principal_id,
+        source_event_id,
+        serde_json::json!({
+            "schema": "hekate.position_integration.v1",
+            "operation": {
+                "action": "establish",
+                "subject": "independent position",
+                "stance": "support",
+                "reasons": ["supported by source"],
+                "reconsideration_conditions": ["new contrary evidence"]
+            }
+        })
+        .to_string(),
+    )
+    .await?;
+    engine
+        .verify_integration_candidate(
+            second_candidate_id,
+            config.user_principal_id,
+            "human checked",
+        )
+        .await?;
+    let second = engine.integrate_position(second_candidate_id).await?;
+    let withdrawn_id = position_candidate(
+        &store,
+        config.hekate_principal_id,
+        source_event_id,
+        serde_json::json!({
+            "schema": "hekate.position_integration.v1",
+            "operation": {
+                "action": "withdraw",
+                "position_id": second.position.id.to_string(),
+                "expected_version": 1,
+                "reason": "source was withdrawn"
+            }
+        })
+        .to_string(),
+    )
+    .await?;
+    engine
+        .verify_integration_candidate(withdrawn_id, config.user_principal_id, "human checked")
+        .await?;
+    let withdrawn = engine.integrate_position(withdrawn_id).await?;
+    assert_eq!(withdrawn.position.id, second.position.id);
+    assert_eq!(withdrawn.position.version, 1);
+    assert_eq!(withdrawn.position.status, PositionStatus::Retracted);
+
+    let state = store.state().await?;
+    assert_eq!(Projector::replay(&store.events().await?)?, state);
+    assert_eq!(state.position_integration_materializations.len(), 4);
     engine.shutdown().await?;
     Ok(())
 }

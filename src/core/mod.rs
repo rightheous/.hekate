@@ -26,7 +26,12 @@ pub use evidence::{
     valid_sha256_hex, CompletionClaim, CompletionClaimTransition, CompletionCriterion, EvidenceRef,
     VerificationDisposition,
 };
-pub use integration::{IntegrationMaterialization, IntegrationVerification};
+pub use integration::{
+    position_integration_blocked, IntegrationMaterialization, IntegrationVerification,
+    PositionIntegrationActionKind, PositionIntegrationEventPayload,
+    PositionIntegrationMaterialization, PositionIntegrationOperation, PositionIntegrationProposal,
+    POSITION_INTEGRATION_SCHEMA,
+};
 pub use model::{
     now, ActionIntent, ActionIntentId, ActionProposal, ActiveMemory, ActiveMemoryStatus, Approval,
     ApprovalId, ApprovalStatus, Artifact, ArtifactId, Attempt, AttemptId, AttemptStatus,

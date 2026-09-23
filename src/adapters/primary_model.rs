@@ -445,6 +445,12 @@ Do not invent quotes or claim exact wording unless the source is an Observation.
 
 Return one JSON object with exactly these fields:
 {"draft_summary":"short bounded summary","self_review":{"weak_points":[],"possible_counterevidence":[],"revised":false},"candidates":[{"kind":"memory","content":"candidate content","rationale":"why this may be durable","source_event_ids":["existing-event-id"],"counterevidence_event_ids":[],"confidence":75}]}
+For kind position, content must be a JSON string using schema hekate.position_integration.v1.
+Choose exactly one stance value: support, oppose, uncertain, or neutral.
+Establish example: {"schema":"hekate.position_integration.v1","operation":{"action":"establish","subject":"short topic","stance":"support","reasons":["evidence-based reason"],"reconsideration_conditions":["condition"]}}.
+Revise example: {"schema":"hekate.position_integration.v1","operation":{"action":"revise","position_id":"existing-active-hekate-position-id","expected_version":1,"stance":"oppose","reasons":["new evidence"],"reconsideration_conditions":["condition"]}}.
+Withdraw example: {"schema":"hekate.position_integration.v1","operation":{"action":"withdraw","position_id":"existing-active-hekate-position-id","expected_version":1,"reason":"why it no longer applies"}}.
+Use only active HEKATE Position IDs and their current expected_version. Never include principal_id, invent Position IDs, or copy user Positions. If an unresolved conflict concerns the subject or Position, do not propose a Position change. A Position candidate is for later human verification, never a direct state change.
 Use no candidate ID, sleep run ID, status, fingerprint, or arbitrary entity ID.
 Prefer no candidate over a weak or unsupported candidate.
 "#;

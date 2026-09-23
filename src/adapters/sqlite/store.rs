@@ -282,6 +282,7 @@ async fn write_projection(
     state: &CurrentState,
 ) -> Result<(), StorageError> {
     for table in [
+        "position_integration_materializations",
         "integration_candidate_materializations",
         "integration_candidate_verifications",
         "completion_claims",
@@ -645,6 +646,35 @@ async fn write_projection(
         .bind(materialization.candidate_id.to_string())
         .bind(materialization.memory_candidate_id.to_string())
         .bind(materialization.memory_id.to_string())
+        .bind(json_text(&materialization.source_event_ids)?)
+        .bind(json_text(&materialization.counterevidence_event_ids)?)
+        .bind(json_text(&materialization.evidence_refs)?)
+        .bind(&materialization.fingerprint)
+        .bind(materialization.as_of_revision as i64)
+        .bind(&materialization.created_at)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|error| StorageError::Backend(error.to_string()))?;
+    }
+    for materialization in state.position_integration_materializations.values() {
+        sqlx::query(
+            "INSERT INTO position_integration_materializations
+             (candidate_id, position_id, position_event_id, action, prior_position_json,
+              source_event_ids_json, counterevidence_event_ids_json, evidence_refs_json,
+              fingerprint, as_of_revision, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(materialization.candidate_id.to_string())
+        .bind(materialization.position_id.to_string())
+        .bind(materialization.position_event_id.to_string())
+        .bind(enum_text(&materialization.action))
+        .bind(
+            materialization
+                .prior_position
+                .as_ref()
+                .map(json_text)
+                .transpose()?,
+        )
         .bind(json_text(&materialization.source_event_ids)?)
         .bind(json_text(&materialization.counterevidence_event_ids)?)
         .bind(json_text(&materialization.evidence_refs)?)
