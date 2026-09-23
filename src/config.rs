@@ -44,6 +44,16 @@ pub struct Config {
     pub embedding_timeout_seconds: u64,
     #[serde(default = "default_embedding_batch_size")]
     pub embedding_batch_size: usize,
+    #[serde(default = "default_sleep_worker_idle_seconds")]
+    pub sleep_worker_idle_seconds: u64,
+    #[serde(default = "default_sleep_worker_completed_seconds")]
+    pub sleep_worker_completed_seconds: u64,
+    #[serde(default = "default_sleep_worker_deferred_seconds")]
+    pub sleep_worker_deferred_seconds: u64,
+    #[serde(default = "default_sleep_worker_initial_backoff_seconds")]
+    pub sleep_worker_initial_backoff_seconds: u64,
+    #[serde(default = "default_sleep_worker_max_backoff_seconds")]
+    pub sleep_worker_max_backoff_seconds: u64,
 }
 
 impl Default for Config {
@@ -67,6 +77,11 @@ impl Default for Config {
             embedding_dimensions: default_embedding_dimensions(),
             embedding_timeout_seconds: default_embedding_timeout_seconds(),
             embedding_batch_size: default_embedding_batch_size(),
+            sleep_worker_idle_seconds: default_sleep_worker_idle_seconds(),
+            sleep_worker_completed_seconds: default_sleep_worker_completed_seconds(),
+            sleep_worker_deferred_seconds: default_sleep_worker_deferred_seconds(),
+            sleep_worker_initial_backoff_seconds: default_sleep_worker_initial_backoff_seconds(),
+            sleep_worker_max_backoff_seconds: default_sleep_worker_max_backoff_seconds(),
         }
     }
 }
@@ -82,6 +97,8 @@ pub enum ConfigError {
     Parse(#[from] toml::de::Error),
     #[error("invalid environment variable {name}: {value}")]
     InvalidEnvironment { name: String, value: String },
+    #[error("invalid config: {0}")]
+    Invalid(String),
 }
 
 impl Config {
@@ -168,7 +185,77 @@ impl Config {
                     value,
                 })?;
         }
+        if let Ok(value) = std::env::var("HEKATE_SLEEP_WORKER_IDLE_SECONDS") {
+            config.sleep_worker_idle_seconds =
+                value.parse().map_err(|_| ConfigError::InvalidEnvironment {
+                    name: "HEKATE_SLEEP_WORKER_IDLE_SECONDS".to_owned(),
+                    value,
+                })?;
+        }
+        if let Ok(value) = std::env::var("HEKATE_SLEEP_WORKER_COMPLETED_SECONDS") {
+            config.sleep_worker_completed_seconds =
+                value.parse().map_err(|_| ConfigError::InvalidEnvironment {
+                    name: "HEKATE_SLEEP_WORKER_COMPLETED_SECONDS".to_owned(),
+                    value,
+                })?;
+        }
+        if let Ok(value) = std::env::var("HEKATE_SLEEP_WORKER_DEFERRED_SECONDS") {
+            config.sleep_worker_deferred_seconds =
+                value.parse().map_err(|_| ConfigError::InvalidEnvironment {
+                    name: "HEKATE_SLEEP_WORKER_DEFERRED_SECONDS".to_owned(),
+                    value,
+                })?;
+        }
+        if let Ok(value) = std::env::var("HEKATE_SLEEP_WORKER_INITIAL_BACKOFF_SECONDS") {
+            config.sleep_worker_initial_backoff_seconds =
+                value.parse().map_err(|_| ConfigError::InvalidEnvironment {
+                    name: "HEKATE_SLEEP_WORKER_INITIAL_BACKOFF_SECONDS".to_owned(),
+                    value,
+                })?;
+        }
+        if let Ok(value) = std::env::var("HEKATE_SLEEP_WORKER_MAX_BACKOFF_SECONDS") {
+            config.sleep_worker_max_backoff_seconds =
+                value.parse().map_err(|_| ConfigError::InvalidEnvironment {
+                    name: "HEKATE_SLEEP_WORKER_MAX_BACKOFF_SECONDS".to_owned(),
+                    value,
+                })?;
+        }
+        config.validate()?;
         Ok(config)
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.sleep_worker_idle_seconds == 0 {
+            return Err(ConfigError::Invalid(
+                "sleep_worker_idle_seconds must be greater than zero".to_owned(),
+            ));
+        }
+        if self.sleep_worker_completed_seconds == 0 {
+            return Err(ConfigError::Invalid(
+                "sleep_worker_completed_seconds must be greater than zero".to_owned(),
+            ));
+        }
+        if self.sleep_worker_deferred_seconds == 0 {
+            return Err(ConfigError::Invalid(
+                "sleep_worker_deferred_seconds must be greater than zero".to_owned(),
+            ));
+        }
+        if self.sleep_worker_initial_backoff_seconds == 0 {
+            return Err(ConfigError::Invalid(
+                "sleep_worker_initial_backoff_seconds must be greater than zero".to_owned(),
+            ));
+        }
+        if self.sleep_worker_max_backoff_seconds == 0 {
+            return Err(ConfigError::Invalid(
+                "sleep_worker_max_backoff_seconds must be greater than zero".to_owned(),
+            ));
+        }
+        if self.sleep_worker_max_backoff_seconds < self.sleep_worker_initial_backoff_seconds {
+            return Err(ConfigError::Invalid(
+                "sleep_worker_max_backoff_seconds must be at least the initial backoff".to_owned(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -229,6 +316,26 @@ fn default_embedding_timeout_seconds() -> u64 {
 
 fn default_embedding_batch_size() -> usize {
     16
+}
+
+fn default_sleep_worker_idle_seconds() -> u64 {
+    300
+}
+
+fn default_sleep_worker_completed_seconds() -> u64 {
+    30
+}
+
+fn default_sleep_worker_deferred_seconds() -> u64 {
+    60
+}
+
+fn default_sleep_worker_initial_backoff_seconds() -> u64 {
+    30
+}
+
+fn default_sleep_worker_max_backoff_seconds() -> u64 {
+    900
 }
 
 fn default_hekate_id() -> PrincipalId {

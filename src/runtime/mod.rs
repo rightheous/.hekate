@@ -12,6 +12,7 @@ pub mod recall;
 pub mod recovery;
 pub mod response_profile;
 pub mod sleep;
+pub mod sleep_worker;
 
 pub use completion::{
     CompletionCriterionStatus, CompletionError, CompletionGate, CompletionGateResult,
@@ -27,3 +28,4 @@ pub use memory_integration::{
 };
 pub use projector::{ProjectionError, Projector};
 pub use sleep::{SleepOnceResult, SleepOnceStatus, SleepStatus};
+pub use sleep_worker::{SleepService, SleepWorker, SleepWorkerConfig, SleepWorkerError};

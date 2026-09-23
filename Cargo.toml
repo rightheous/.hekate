@@ -22,7 +22,7 @@ sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["macros", "sqlite", "runtime-tokio-rustls", "migrate"] }
 thiserror = "1"
 time = { version = "0.3", features = ["formatting"] }
-tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "process", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "process", "rt-multi-thread", "signal", "time"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

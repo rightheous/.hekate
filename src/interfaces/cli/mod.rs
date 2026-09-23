@@ -16,6 +16,7 @@ use crate::core::{
 use crate::ports::EmbeddingStore;
 use crate::runtime::embedding_indexer::{embedding_documents, EmbeddingIndexer};
 use crate::runtime::engine::Engine;
+use crate::runtime::sleep_worker::{SleepWorker, SleepWorkerConfig};
 
 mod repl;
 
@@ -83,6 +84,8 @@ pub struct Cli {
     #[arg(long)]
     pub integration_reason: Option<String>,
     #[arg(long)]
+    pub sleep_worker: bool,
+    #[arg(long)]
     pub memory_candidate: Option<String>,
     #[arg(long)]
     pub memory_kind: Option<String>,
@@ -112,6 +115,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     }
     validate_sleep_args(&cli)?;
     validate_integration_args(&cli)?;
+    if cli.sleep_worker {
+        validate_sleep_worker_args(&cli)?;
+    }
     validate_completion_args(&cli)?;
     let mut config = Config::load(cli.config.as_deref())?;
     if let Some(database_url) = cli.database_url.clone() {
@@ -133,6 +139,14 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         return run_embedding_command(&config, &cli).await;
     }
     let engine = build_engine(&config).await?;
+    if cli.sleep_worker {
+        let worker_config = SleepWorkerConfig::from_config(&config)?;
+        let result = SleepWorker::new(&engine, worker_config)?.run().await;
+        let shutdown = engine.shutdown().await;
+        result?;
+        shutdown?;
+        return Ok(());
+    }
     if cli.chat {
         let thread_id = cli
             .thread_id
@@ -195,6 +209,132 @@ fn validate_integration_args(cli: &Cli) -> anyhow::Result<()> {
         anyhow::bail!("verification and rejection require --integration-reason")
     }
     Ok(())
+}
+
+fn validate_sleep_worker_args(cli: &Cli) -> anyhow::Result<()> {
+    let mut conflicts = Vec::new();
+    if cli.chat {
+        conflicts.push("--chat");
+    }
+    if !cli.message.is_empty() {
+        conflicts.push("MESSAGE");
+    }
+    if cli.thread_id.is_some() {
+        conflicts.push("--thread-id");
+    }
+    if cli.message_id.is_some() {
+        conflicts.push("--message-id");
+    }
+    if cli.inspect {
+        conflicts.push("--inspect");
+    }
+    if cli.identity {
+        conflicts.push("--identity");
+    }
+    if cli.positions {
+        conflicts.push("--positions");
+    }
+    if cli.conflicts {
+        conflicts.push("--conflicts");
+    }
+    if cli.goals {
+        conflicts.push("--goals");
+    }
+    if cli.tasks {
+        conflicts.push("--tasks");
+    }
+    if cli.completion_status.is_some() {
+        conflicts.push("--completion-status");
+    }
+    if cli.completion_claims {
+        conflicts.push("--completion-claims");
+    }
+    if cli.runs {
+        conflicts.push("--runs");
+    }
+    if cli.pending {
+        conflicts.push("--pending");
+    }
+    if cli.resume {
+        conflicts.push("--resume");
+    }
+    if cli.memory_list {
+        conflicts.push("--memory-list");
+    }
+    if cli.response_profile {
+        conflicts.push("--response-profile");
+    }
+    if cli.json {
+        conflicts.push("--json");
+    }
+    if cli.embedding_status {
+        conflicts.push("--embedding-status");
+    }
+    if cli.embedding_index_once {
+        conflicts.push("--embedding-index-once");
+    }
+    if cli.embedding_search.is_some() {
+        conflicts.push("--embedding-search");
+    }
+    if cli.sleep_once {
+        conflicts.push("--sleep-once");
+    }
+    if cli.sleep_status {
+        conflicts.push("--sleep-status");
+    }
+    if cli.integration_candidates {
+        conflicts.push("--integration-candidates");
+    }
+    if cli.verify_integration.is_some() {
+        conflicts.push("--verify-integration");
+    }
+    if cli.reject_integration.is_some() {
+        conflicts.push("--reject-integration");
+    }
+    if cli.integrate_memory.is_some() {
+        conflicts.push("--integrate-memory");
+    }
+    if cli.integration_reason.is_some() {
+        conflicts.push("--integration-reason");
+    }
+    if cli.memory_candidate.is_some() {
+        conflicts.push("--memory-candidate");
+    }
+    if cli.memory_kind.is_some() {
+        conflicts.push("--memory-kind");
+    }
+    if cli.memory_confidence.is_some() {
+        conflicts.push("--memory-confidence");
+    }
+    if cli.promote_memory.is_some() {
+        conflicts.push("--promote-memory");
+    }
+    if cli.reject_memory.is_some() {
+        conflicts.push("--reject-memory");
+    }
+    if cli.supersede_memory.is_some() {
+        conflicts.push("--supersede-memory");
+    }
+    if cli.expire_memory.is_some() {
+        conflicts.push("--expire-memory");
+    }
+    if cli.approve.is_some() {
+        conflicts.push("--approve");
+    }
+    if cli.deny.is_some() {
+        conflicts.push("--deny");
+    }
+    if cli.execute.is_some() {
+        conflicts.push("--execute");
+    }
+    if conflicts.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "--sleep-worker cannot be combined with {}",
+            conflicts.join(", ")
+        )
+    }
 }
 
 fn validate_response_profile_args(cli: &Cli) -> anyhow::Result<()> {
