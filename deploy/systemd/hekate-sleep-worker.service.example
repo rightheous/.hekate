@@ -1,0 +1,17 @@
+[Unit]
+Description=HEKATE continuous sleep worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=CHANGE_ME
+WorkingDirectory=/path/to/hekate
+ExecStart=/path/to/hekate/target/release/hekate --config /path/to/hekate/config.toml --sleep-worker
+Restart=on-failure
+RestartSec=30s
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+
+[Install]
+WantedBy=multi-user.target

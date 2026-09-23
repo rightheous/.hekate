@@ -703,7 +703,7 @@ fn empty_result(status: SleepOnceStatus) -> SleepOnceResult {
     }
 }
 
-fn foreground_blocked(state: &crate::core::CurrentState) -> bool {
+pub(crate) fn foreground_blocked(state: &crate::core::CurrentState) -> bool {
     state.active_run().is_some()
         || state
             .attempts
