@@ -135,6 +135,15 @@ impl EmbeddingIndexer {
         query: &str,
         limit: usize,
     ) -> Result<Vec<EmbeddingMatch>, EmbeddingIndexError> {
+        self.search_excluding(query, &[], limit).await
+    }
+
+    pub async fn search_excluding(
+        &self,
+        query: &str,
+        exclude_event_ids: &[EventId],
+        limit: usize,
+    ) -> Result<Vec<EmbeddingMatch>, EmbeddingIndexError> {
         let space = self.provider.space();
         let query = match self.provider.embed_query(query).await {
             Ok(query) => query,
@@ -143,7 +152,10 @@ impl EmbeddingIndexer {
                 return Err(error.into());
             }
         };
-        Ok(self.store.search_embeddings(space, &query, limit).await?)
+        Ok(self
+            .store
+            .search_embeddings(space, &query, exclude_event_ids, limit)
+            .await?)
     }
 }
 

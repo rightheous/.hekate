@@ -1,10 +1,12 @@
+use std::collections::HashSet;
+
 use async_trait::async_trait;
 use sqlx::Row;
 
 use crate::adapters::sqlite::database::{Database, DatabaseError};
 use crate::core::{
     now, EmbeddingDocument, EmbeddingEntityKind, EmbeddingMatch, EmbeddingSpace, EmbeddingStatus,
-    EmbeddingVector,
+    EmbeddingVector, EventId,
 };
 use crate::ports::{EmbeddingStore, EmbeddingStoreError};
 
@@ -206,6 +208,7 @@ impl EmbeddingStore for SqliteEmbeddingStore {
         &self,
         space: &EmbeddingSpace,
         query: &EmbeddingVector,
+        exclude_event_ids: &[EventId],
         limit: usize,
     ) -> Result<Vec<EmbeddingMatch>, EmbeddingStoreError> {
         let rows = sqlx::query(
@@ -217,8 +220,18 @@ impl EmbeddingStore for SqliteEmbeddingStore {
         .await
         .map_err(backend)?;
         let mut matches = Vec::with_capacity(rows.len());
+        let excluded = exclude_event_ids.iter().copied().collect::<HashSet<_>>();
         for row in rows {
             let record_id: String = row.try_get("id").map_err(backend)?;
+            let source_event_id = uuid::Uuid::parse_str(
+                &row.try_get::<String, _>("source_event_id")
+                    .map_err(backend)?,
+            )
+            .map(crate::core::EventId::from)
+            .map_err(|_| EmbeddingStoreError::Backend("invalid source event ID".to_owned()))?;
+            if excluded.contains(&source_event_id) {
+                continue;
+            }
             let kind: String = row.try_get("entity_kind").map_err(backend)?;
             let vector_blob: Vec<u8> = row.try_get("vector_blob").map_err(backend)?;
             let vector = EmbeddingVector::from_blob(&vector_blob, space).map_err(|reason| {
@@ -227,12 +240,6 @@ impl EmbeddingStore for SqliteEmbeddingStore {
                     reason,
                 }
             })?;
-            let source_event_id = uuid::Uuid::parse_str(
-                &row.try_get::<String, _>("source_event_id")
-                    .map_err(backend)?,
-            )
-            .map(crate::core::EventId::from)
-            .map_err(|_| EmbeddingStoreError::Backend("invalid source event ID".to_owned()))?;
             matches.push(EmbeddingMatch {
                 entity_kind: parse_entity_kind(&kind)?,
                 entity_id: row.try_get("entity_id").map_err(backend)?,
@@ -241,7 +248,15 @@ impl EmbeddingStore for SqliteEmbeddingStore {
                 score: query.dot(&vector),
             });
         }
-        matches.sort_by(|left, right| right.score.total_cmp(&left.score));
+        matches.sort_by(|left, right| {
+            right
+                .score
+                .total_cmp(&left.score)
+                .then_with(|| left.source_event_id.cmp(&right.source_event_id))
+                .then_with(|| entity_kind(&left.entity_kind).cmp(entity_kind(&right.entity_kind)))
+                .then_with(|| left.entity_id.cmp(&right.entity_id))
+                .then_with(|| left.source_text_hash.cmp(&right.source_text_hash))
+        });
         matches.truncate(limit);
         Ok(matches)
     }

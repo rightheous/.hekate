@@ -47,10 +47,11 @@ impl SemanticRecall {
             return Ok(bundle);
         }
         let candidate_limit = limit.saturating_mul(2).min(MAX_RECALL_CANDIDATES);
-        let mut matches = self.indexer.search(&query.text, candidate_limit).await?;
-        matches.retain(|item| {
-            item.score.is_finite() && !query.exclude_event_ids.contains(&item.source_event_id)
-        });
+        let mut matches = self
+            .indexer
+            .search_excluding(&query.text, &query.exclude_event_ids, candidate_limit)
+            .await?;
+        matches.retain(|item| item.score.is_finite());
         matches.sort_by(|left, right| {
             right.score.total_cmp(&left.score).then_with(|| {
                 left.source_event_id

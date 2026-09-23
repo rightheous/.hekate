@@ -3,7 +3,7 @@ use thiserror::Error;
 
 use crate::core::{
     EmbeddingDocument, EmbeddingMatch, EmbeddingSpace, EmbeddingStatus, EmbeddingValidationError,
-    EmbeddingVector,
+    EmbeddingVector, EventId,
 };
 
 #[derive(Debug, Error)]
@@ -92,6 +92,7 @@ pub trait EmbeddingStore: Send + Sync {
         &self,
         space: &EmbeddingSpace,
         query: &EmbeddingVector,
+        exclude_event_ids: &[EventId],
         limit: usize,
     ) -> Result<Vec<EmbeddingMatch>, EmbeddingStoreError>;
     async fn embedding_status(
