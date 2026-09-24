@@ -312,8 +312,77 @@ fn unused_calls() -> Arc<AtomicUsize> {
     Arc::new(AtomicUsize::new(0))
 }
 
-#[tokio::test]
-async fn normal_decision_closes_attempt_and_sleep_runs_with_open_run() {
+struct EvalCase {
+    scenario: &'static str,
+    elapsed_ms: u128,
+    sleep_status: String,
+    cursor_before: Option<u64>,
+    cursor_after: Option<u64>,
+    observation_count: usize,
+    decision_count: usize,
+    started_attempt_count: usize,
+    projection_verified: bool,
+    error_kind: Option<String>,
+}
+
+impl EvalCase {
+    fn json(&self, iteration: usize, commit: &str) -> serde_json::Value {
+        serde_json::json!({
+            "scenario": self.scenario,
+            "iteration": iteration,
+            "result": "passed",
+            "elapsed_ms": self.elapsed_ms,
+            "sleep_status": self.sleep_status,
+            "cursor_before": self.cursor_before,
+            "cursor_after": self.cursor_after,
+            "observation_count": self.observation_count,
+            "decision_count": self.decision_count,
+            "started_attempt_count": self.started_attempt_count,
+            "projection_verified": self.projection_verified,
+            "error_kind": self.error_kind,
+            "commit": commit,
+        })
+    }
+}
+
+fn eval_case(
+    scenario: &'static str,
+    started_at: Instant,
+    sleep_status: String,
+    cursor_before: Option<u64>,
+    cursor_after: Option<u64>,
+    state: &hekate::core::CurrentState,
+    events: &[ExperienceEvent],
+    projection_verified: bool,
+    error_kind: Option<&str>,
+) -> EvalCase {
+    EvalCase {
+        scenario,
+        elapsed_ms: started_at.elapsed().as_millis(),
+        sleep_status,
+        cursor_before,
+        cursor_after,
+        observation_count: state.observations.len(),
+        decision_count: state.decisions.len(),
+        started_attempt_count: events
+            .iter()
+            .filter(|event| event.event_kind == EventKind::AttemptStarted)
+            .count(),
+        projection_verified,
+        error_kind: error_kind.map(str::to_owned),
+    }
+}
+
+fn status_text(status: &SleepOnceStatus) -> String {
+    serde_json::to_value(status)
+        .expect("sleep status")
+        .as_str()
+        .expect("status string")
+        .to_owned()
+}
+
+async fn run_normal_decision_scenario() -> EvalCase {
+    let started_at = Instant::now();
     let url = database_url("success");
     let store = Arc::new(SqliteStore::open(&url).await.expect("store"));
     let (foreground, _) = ForegroundModel::normal();
@@ -339,17 +408,24 @@ async fn normal_decision_closes_attempt_and_sleep_runs_with_open_run() {
     let slept = engine.sleep_once().await.expect("sleep");
     assert!(matches!(slept.status, SleepOnceStatus::Completed));
     assert_eq!(sleep_calls.load(Ordering::SeqCst), 1);
-    assert!(
-        engine
-            .recovery_report()
-            .await
-            .expect("recovery")
-            .projection_verified
-    );
+    let recovery = engine.recovery_report().await.expect("recovery");
+    let state = store.state().await.expect("final state");
+    let events = store.events().await.expect("events");
+    eval_case(
+        "normal_response_open_run",
+        started_at,
+        status_text(&slept.status),
+        slept.cursor_before,
+        slept.cursor_after,
+        &state,
+        &events,
+        recovery.projection_verified,
+        None,
+    )
 }
 
-#[tokio::test]
-async fn foreground_timeout_fails_attempt_restart_sleep_and_message_retry_reuses_events() {
+async fn run_timeout_retry_scenario() -> EvalCase {
+    let started_at = Instant::now();
     let url = database_url("retry");
     let first_store = Arc::new(SqliteStore::open(&url).await.expect("store"));
     let (foreground, model_calls) = ForegroundModel::timeout_first();
@@ -421,17 +497,24 @@ async fn foreground_timeout_fails_attempt_restart_sleep_and_message_retry_reuses
             .count(),
         2
     );
-    assert!(
-        restarted
-            .recovery_report()
-            .await
-            .expect("final replay")
-            .projection_verified
-    );
+    let recovery = restarted.recovery_report().await.expect("final replay");
+    let state = restarted_store.state().await.expect("final state");
+    let events = restarted_store.events().await.expect("final events");
+    eval_case(
+        "timeout_restart_and_retry",
+        started_at,
+        status_text(&sleep_result.status),
+        sleep_result.cursor_before,
+        sleep_result.cursor_after,
+        &state,
+        &events,
+        recovery.projection_verified,
+        Some("timeout"),
+    )
 }
 
-#[tokio::test]
-async fn live_lease_defers_sleep_across_connections_and_release_is_owner_scoped() {
+async fn run_live_lease_scenario() -> EvalCase {
+    let started_at = Instant::now();
     let url = database_url("live-lease");
     let foreground_store = Arc::new(SqliteStore::open(&url).await.expect("foreground store"));
     let sleep_store = Arc::new(SqliteStore::open(&url).await.expect("sleep store"));
@@ -472,13 +555,32 @@ async fn live_lease_defers_sleep_across_connections_and_release_is_owner_scoped(
         .foreground_active()
         .await
         .expect("released lease"));
+    let recovery = sleep_engine.recovery_report().await.expect("recovery");
+    let state = sleep_store.state().await.expect("state");
+    let events = sleep_store.events().await.expect("events");
+    eval_case(
+        "live_lease_defers_sleep",
+        started_at,
+        status_text(&result.status),
+        result.cursor_before,
+        result.cursor_after,
+        &state,
+        &events,
+        recovery.projection_verified,
+        None,
+    )
 }
 
-#[tokio::test]
-async fn expired_lease_is_reacquired_without_old_owner_clearing_new_owner() {
+async fn run_expired_lease_scenario() -> EvalCase {
+    let started_at = Instant::now();
     let url = database_url("expired-lease");
     let first = SqliteStore::open(&url).await.expect("first store");
     let second = SqliteStore::open(&url).await.expect("second store");
+    let seed = observation("sleep resumes after foreground owner expires");
+    Projector::new(Arc::new(second.clone()))
+        .record(observation_event(&seed))
+        .await
+        .expect("seed observation");
     assert!(first
         .acquire_foreground_lease("old-owner", Duration::from_millis(10))
         .await
@@ -488,6 +590,18 @@ async fn expired_lease_is_reacquired_without_old_owner_clearing_new_owner() {
         .has_active_foreground_lease()
         .await
         .expect("expired lease"));
+
+    let (sleep, sleep_calls) = SleepModel::normal();
+    let sleep_engine = engine(
+        Arc::new(second.clone()),
+        ForegroundModel::normal().0,
+        sleep,
+        unused_calls(),
+    );
+    let slept = sleep_engine.sleep_once().await.expect("sleep after expiry");
+    assert!(matches!(slept.status, SleepOnceStatus::Completed));
+    assert_eq!(sleep_calls.load(Ordering::SeqCst), 1);
+
     assert!(second
         .acquire_foreground_lease("new-owner", Duration::from_secs(5))
         .await
@@ -504,10 +618,24 @@ async fn expired_lease_is_reacquired_without_old_owner_clearing_new_owner() {
         .release_foreground_lease("new-owner")
         .await
         .expect("new owner release");
+    let recovery = sleep_engine.recovery_report().await.expect("recovery");
+    let state = second.state().await.expect("state");
+    let events = second.events().await.expect("events");
+    eval_case(
+        "expired_lease_releases_sleep",
+        started_at,
+        status_text(&slept.status),
+        slept.cursor_before,
+        slept.cursor_after,
+        &state,
+        &events,
+        recovery.projection_verified,
+        None,
+    )
 }
 
-#[tokio::test]
-async fn sleep_ignores_open_run_stale_attempt_pending_approval_and_unknown_operation() {
+async fn run_stale_records_scenario() -> EvalCase {
+    let started_at = Instant::now();
     let url = database_url("stale-foreground-state");
     let store = Arc::new(SqliteStore::open(&url).await.expect("store"));
     let projector = Projector::new(store.clone());
@@ -617,17 +745,23 @@ async fn sleep_ignores_open_run_stale_attempt_pending_approval_and_unknown_opera
         state.operations[&operation.id].status,
         OperationStatus::Unknown
     ));
-    assert!(
-        engine
-            .recovery_report()
-            .await
-            .expect("replay")
-            .projection_verified
-    );
+    let recovery = engine.recovery_report().await.expect("replay");
+    let events = store.events().await.expect("events");
+    eval_case(
+        "stale_records_do_not_block_sleep",
+        started_at,
+        status_text(&result.status),
+        result.cursor_before,
+        result.cursor_after,
+        &state,
+        &events,
+        recovery.projection_verified,
+        None,
+    )
 }
 
-#[tokio::test]
-async fn foreground_input_interrupts_sleep_without_advancing_cursor_or_candidates() {
+async fn run_foreground_sleep_race_scenario() -> EvalCase {
+    let started_at = Instant::now();
     let url = database_url("concurrent");
     let sleep_store = Arc::new(SqliteStore::open(&url).await.expect("sleep store"));
     let seed = observation("seed before concurrent foreground input");
@@ -676,17 +810,49 @@ async fn foreground_input_interrupts_sleep_without_advancing_cursor_or_candidate
         result.cursor_before.expect("cursor before")
     );
     assert!(state.integration_candidates.is_empty());
-    assert!(
-        sleep_engine
-            .recovery_report()
-            .await
-            .expect("replay")
-            .projection_verified
+    let (next_sleep, next_sleep_calls) = SleepModel::normal();
+    let next_engine = engine(
+        sleep_store.clone(),
+        ForegroundModel::normal().0,
+        next_sleep,
+        unused_calls(),
     );
+    let retried = next_engine.sleep_once().await.expect("next sleep cycle");
+    assert!(matches!(retried.status, SleepOnceStatus::Completed));
+    assert!(retried.cursor_after.is_some());
+    assert_eq!(next_sleep_calls.load(Ordering::SeqCst), 1);
+    let recovery = next_engine.recovery_report().await.expect("replay");
+    let state = sleep_store.state().await.expect("final state");
+    let events = sleep_store.events().await.expect("events");
+    eval_case(
+        "foreground_interrupts_sleep_then_retries",
+        started_at,
+        "interrupted_then_completed".to_owned(),
+        result.cursor_before,
+        retried.cursor_after,
+        &state,
+        &events,
+        recovery.projection_verified,
+        Some("foreground_activity"),
+    )
 }
 
 #[tokio::test]
-async fn ten_independent_lifecycle_runs_write_jsonl_evaluation() {
+async fn lifecycle_contract_scenarios_pass() {
+    for case in [
+        run_normal_decision_scenario().await,
+        run_timeout_retry_scenario().await,
+        run_live_lease_scenario().await,
+        run_expired_lease_scenario().await,
+        run_stale_records_scenario().await,
+        run_foreground_sleep_race_scenario().await,
+    ] {
+        assert!(case.projection_verified, "{} replay", case.scenario);
+    }
+}
+
+#[tokio::test]
+async fn ten_runs_of_each_lifecycle_scenario_write_jsonl_evaluation() {
     let commit = Command::new("git")
         .args(["rev-parse", "HEAD"])
         .output()
@@ -695,41 +861,19 @@ async fn ten_independent_lifecycle_runs_write_jsonl_evaluation() {
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
         .unwrap_or_else(|| "unknown".to_owned());
     let mut records = Vec::new();
-    for iteration in 0..10 {
-        let started_at = Instant::now();
-        let url = database_url(&format!("eval-{iteration}"));
-        let store = Arc::new(SqliteStore::open(&url).await.expect("eval store"));
-        let (foreground, _) = ForegroundModel::normal();
-        let (sleep, _) = SleepModel::normal();
-        let engine = engine(store.clone(), foreground, sleep, unused_calls());
-        engine
-            .handle(observation("evaluation foreground input"))
-            .await
-            .expect("eval foreground");
-        let slept = engine.sleep_once().await.expect("eval sleep");
-        let recovery = engine.recovery_report().await.expect("eval projection");
-        let events = store.events().await.expect("eval events");
-        let state = store.state().await.expect("eval state");
-        let sleep_status = serde_json::to_value(&slept.status)
-            .expect("sleep status")
-            .as_str()
-            .expect("status string")
-            .to_owned();
-        records.push(serde_json::json!({
-            "scenario": "foreground_success_then_sleep",
-            "iteration": iteration + 1,
-            "result": if matches!(slept.status, SleepOnceStatus::Completed) && recovery.projection_verified { "passed" } else { "failed" },
-            "elapsed_ms": started_at.elapsed().as_millis(),
-            "sleep_status": sleep_status,
-            "cursor_before": slept.cursor_before,
-            "cursor_after": slept.cursor_after,
-            "observation_count": state.observations.len(),
-            "decision_count": state.decisions.len(),
-            "started_attempt_count": events.iter().filter(|event| event.event_kind == EventKind::AttemptStarted).count(),
-            "projection_verified": recovery.projection_verified,
-            "error_kind": slept.error_kind,
-            "commit": commit,
-        }));
+    for iteration in 1..=10 {
+        let cases = [
+            run_normal_decision_scenario().await,
+            run_timeout_retry_scenario().await,
+            run_live_lease_scenario().await,
+            run_expired_lease_scenario().await,
+            run_stale_records_scenario().await,
+            run_foreground_sleep_race_scenario().await,
+        ];
+        for case in cases {
+            assert!(case.projection_verified, "{} replay", case.scenario);
+            records.push(case.json(iteration, &commit));
+        }
     }
     let path = std::path::Path::new("target/hekate-evals/foreground-sleep-lifecycle.jsonl");
     fs::create_dir_all(path.parent().expect("eval parent")).expect("eval directory");
@@ -739,10 +883,26 @@ async fn ten_independent_lifecycle_runs_write_jsonl_evaluation() {
         .collect::<Vec<_>>()
         .join("\n");
     fs::write(path, format!("{jsonl}\n")).expect("write lifecycle evaluation");
-    assert_eq!(records.len(), 10);
+    assert_eq!(records.len(), 60);
     assert!(records
         .iter()
         .all(|record| record["result"] == "passed" && record["projection_verified"] == true));
+    for scenario in [
+        "normal_response_open_run",
+        "timeout_restart_and_retry",
+        "live_lease_defers_sleep",
+        "expired_lease_releases_sleep",
+        "stale_records_do_not_block_sleep",
+        "foreground_interrupts_sleep_then_retries",
+    ] {
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record["scenario"] == scenario)
+                .count(),
+            10
+        );
+    }
 }
 
 fn event_for<T: serde::Serialize>(
