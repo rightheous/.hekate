@@ -1,7 +1,11 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::Serialize;
 use thiserror::Error;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
+use uuid::Uuid;
 
 use crate::core::event::{
     EntityKind, EntityRef, EventError, EventKind, EventSource, ExperienceEvent,
@@ -72,6 +76,10 @@ pub enum EngineError {
     NotFound(String),
     #[error("operation cannot continue: {0}")]
     InvalidOperation(String),
+    #[error("another foreground execution is active")]
+    ForegroundActivityBusy,
+    #[error("foreground activity lease was lost")]
+    ForegroundActivityLeaseLost,
     #[error(transparent)]
     Completion(#[from] CompletionError),
     #[error(transparent)]
@@ -82,6 +90,71 @@ pub enum EngineError {
     Integration(#[from] IntegrationError),
     #[error(transparent)]
     ContextBuilder(#[from] ContextBuilderError),
+}
+
+const FOREGROUND_LEASE_TTL: Duration = Duration::from_secs(30);
+const FOREGROUND_LEASE_RENEWAL: Duration = Duration::from_secs(10);
+
+async fn wait_for_lease_loss(lost: &mut watch::Receiver<bool>) {
+    while !*lost.borrow() {
+        if lost.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+struct ForegroundLease {
+    storage: Arc<dyn Storage>,
+    owner: String,
+    lost: watch::Receiver<bool>,
+    renewal: JoinHandle<()>,
+}
+
+impl ForegroundLease {
+    async fn acquire(storage: Arc<dyn Storage>) -> Result<Option<Self>, StorageError> {
+        let owner = Uuid::new_v4().to_string();
+        if !storage
+            .acquire_foreground_lease(&owner, FOREGROUND_LEASE_TTL)
+            .await?
+        {
+            return Ok(None);
+        }
+        let (lost_tx, lost) = watch::channel(false);
+        let renewal_storage = storage.clone();
+        let renewal_owner = owner.clone();
+        let renewal = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(FOREGROUND_LEASE_RENEWAL).await;
+                match renewal_storage
+                    .renew_foreground_lease(&renewal_owner, FOREGROUND_LEASE_TTL)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) | Err(_) => {
+                        let _ = lost_tx.send(true);
+                        break;
+                    }
+                }
+            }
+        });
+        Ok(Some(Self {
+            storage,
+            owner,
+            lost,
+            renewal,
+        }))
+    }
+
+    async fn release(self) -> Result<(), StorageError> {
+        self.renewal.abort();
+        self.storage.release_foreground_lease(&self.owner).await
+    }
+}
+
+impl Drop for ForegroundLease {
+    fn drop(&mut self) {
+        self.renewal.abort();
+    }
 }
 
 pub struct Engine {
@@ -136,6 +209,10 @@ impl Engine {
         self.user_id
     }
 
+    pub async fn foreground_active(&self) -> Result<bool, EngineError> {
+        Ok(self.storage.has_active_foreground_lease().await?)
+    }
+
     pub async fn handle(&self, observation: Observation) -> Result<InteractionResult, EngineError> {
         if self.user_id == self.hekate_id {
             return Err(EngineError::InvalidObservation(
@@ -152,14 +229,46 @@ impl Engine {
                 "observation content cannot be empty".to_owned(),
             ));
         }
+        let mut lease = ForegroundLease::acquire(self.storage.clone())
+            .await?
+            .ok_or(EngineError::ForegroundActivityBusy)?;
+        let mut started_attempt = None;
+        let result = self
+            .handle_leased(observation, &mut started_attempt, &mut lease.lost)
+            .await;
+        if result.is_err() {
+            if let Some(attempt) = started_attempt.as_ref() {
+                if let Err(error) = self.complete_attempt(attempt, AttemptStatus::Failed).await {
+                    tracing::warn!(%error, attempt_id = %attempt.id, "failed to close foreground attempt");
+                }
+            }
+        }
+        if let Err(error) = lease.release().await {
+            tracing::warn!(%error, "foreground activity lease release failed");
+        }
+        result
+    }
+
+    async fn handle_leased(
+        &self,
+        observation: Observation,
+        started_attempt: &mut Option<Attempt>,
+        lease_lost: &mut watch::Receiver<bool>,
+    ) -> Result<InteractionResult, EngineError> {
         let state = self.storage.load_state().await?;
-        if let Some(existing) = state.observations.values().find(|existing| {
-            observation.message_id.is_some()
-                && existing.source_type == observation.source_type
-                && existing.source_ref == observation.source_ref
-        }) {
+        if let Some(existing) = state
+            .observations
+            .values()
+            .find(|existing| {
+                observation.message_id.is_some()
+                    && existing.source_type == observation.source_type
+                    && existing.source_ref == observation.source_ref
+                    && existing.message_id == observation.message_id
+            })
+            .cloned()
+        {
             let events = self.storage.load_events().await?;
-            let decision = events
+            let decision: Option<crate::core::Decision> = events
                 .iter()
                 .rev()
                 .find(|event| {
@@ -169,18 +278,56 @@ impl Engine {
                 .map(|event| serde_json::from_value(event.payload.clone()))
                 .transpose()?;
             if let Some(decision) = decision {
+                let operation_id = decision.action.as_ref().and_then(|intent| {
+                    state
+                        .operations
+                        .values()
+                        .find(|operation| operation.intent_id == intent.id)
+                        .map(|operation| operation.id)
+                });
+                let approval_id = operation_id.and_then(|operation_id| {
+                    state
+                        .approvals
+                        .values()
+                        .find(|approval| approval.operation_id == operation_id)
+                        .map(|approval| approval.id)
+                });
                 return Ok(InteractionResult {
                     observation_id: existing.id,
-                    focus: resolve_focus(&state, existing),
+                    focus: resolve_focus(&state, &existing),
                     decision,
                     revision: state.revision,
-                    operation_id: None,
-                    approval_id: None,
+                    operation_id,
+                    approval_id,
                 });
             }
-            return Err(EngineError::InvalidObservation(
-                "duplicate external message has no completed decision".to_owned(),
-            ));
+            let observation_event = events
+                .iter()
+                .find(|event| {
+                    matches!(
+                        event.event_kind,
+                        EventKind::ObservationRecorded | EventKind::UserMessageReceived
+                    ) && event
+                        .subject
+                        .as_ref()
+                        .map(|subject| subject.id == existing.id.uuid())
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .ok_or_else(|| {
+                    EngineError::InvalidObservation(
+                        "duplicate external message is missing its source event".to_owned(),
+                    )
+                })?;
+            return self
+                .process_observation(
+                    existing,
+                    observation_event,
+                    state,
+                    started_attempt,
+                    lease_lost,
+                )
+                .await;
         }
         let _ = self.ensure_identity(state).await?;
         let observation_event = self.event(
@@ -194,15 +341,32 @@ impl Engine {
             Some(observation.id.to_string()),
             None,
         )?;
-        let mut state = self.projector.record(observation_event.clone()).await?;
+        let state = self.projector.record(observation_event.clone()).await?;
+        self.process_observation(
+            observation,
+            observation_event,
+            state,
+            started_attempt,
+            lease_lost,
+        )
+        .await
+    }
 
-        let events = self.storage.load_events().await?;
+    async fn process_observation(
+        &self,
+        observation: Observation,
+        observation_event: ExperienceEvent,
+        mut state: CurrentState,
+        started_attempt: &mut Option<Attempt>,
+        lease_lost: &mut watch::Receiver<bool>,
+    ) -> Result<InteractionResult, EngineError> {
+        let snapshot_events = self.storage.load_events().await?;
         let recall = self
             .recall_bundle(
                 &observation.content,
                 observation_event.event_id,
                 &state,
-                &events,
+                &snapshot_events,
             )
             .await;
         let mut focus = resolve_focus(&state, &observation);
@@ -211,26 +375,45 @@ impl Engine {
                 && relationship.participants.contains(&self.hekate_id))
             .then_some(relationship.id)
         });
-        let as_of_revision = state.revision;
         let context_snapshot = build_context_snapshot(
             &state,
-            &events,
+            &snapshot_events,
             ContextBuildRequest {
                 principal_id: self.user_id,
                 current_observation_id: Some(observation.id),
                 relationship_id,
                 task_id: focus.task_id,
                 run_id: focus.run_id,
-                as_of_revision,
+                as_of_revision: state.revision,
                 recalled: recall.clone(),
                 budget: ContextBudget::default(),
             },
         )?;
         if focus.run_id.is_none() {
-            let (next_state, next_focus) = self.create_focus(&observation).await?;
-            state = next_state;
+            let (_, next_focus) = self.create_focus(&observation).await?;
             focus = next_focus;
         }
+        let run_id = focus.run_id.ok_or_else(|| {
+            EngineError::InvalidOperation("foreground focus has no run".to_owned())
+        })?;
+        let attempt = Attempt {
+            id: crate::core::AttemptId::new(),
+            run_id,
+            status: AttemptStatus::Started,
+            started_at: crate::core::model::now(),
+            finished_at: None,
+        };
+        state = self
+            .append(
+                self.user_id,
+                EventKind::AttemptStarted,
+                Some(EntityRef::new(EntityKind::Attempt, attempt.id.uuid())),
+                &attempt,
+                Some(observation.id.to_string()),
+            )
+            .await?;
+        *started_attempt = Some(attempt.clone());
+
         let context_events = self.storage.load_events().await?;
         let context = crate::runtime::context::build_context_with_recall_and_snapshot(
             &state,
@@ -248,7 +431,11 @@ impl Engine {
                 actual: latest_state.revision,
             });
         }
-        let cycle = match self.model.think(&context).await {
+        let cycle = tokio::select! {
+            result = self.model.think(&context) => result,
+            _ = wait_for_lease_loss(lease_lost) => return Err(EngineError::ForegroundActivityLeaseLost),
+        };
+        let cycle = match cycle {
             Ok(cycle) => cycle,
             Err(error) => {
                 let trace = error.trace().clone();
@@ -486,29 +673,26 @@ impl Engine {
                         correlation_id.clone(),
                         Some(decision_event.event_id),
                     )?);
-                    if let Some(mut attempt) = state
-                        .attempts
-                        .values()
-                        .find(|attempt| {
-                            attempt.run_id == run_id
-                                && matches!(attempt.status, AttemptStatus::Started)
-                        })
-                        .cloned()
-                    {
-                        attempt.status = AttemptStatus::Succeeded;
-                        attempt.finished_at = Some(crate::core::model::now());
-                        final_events.push(self.event(
-                            self.hekate_id,
-                            EventKind::AttemptCompleted,
-                            Some(EntityRef::new(EntityKind::Attempt, attempt.id.uuid())),
-                            &attempt,
-                            correlation_id.clone(),
-                            Some(decision_event.event_id),
-                        )?);
-                    }
                 }
             }
         }
+
+        let mut completed_attempt = started_attempt.as_ref().cloned().ok_or_else(|| {
+            EngineError::InvalidOperation("foreground attempt is missing".to_owned())
+        })?;
+        completed_attempt.status = AttemptStatus::Succeeded;
+        completed_attempt.finished_at = Some(crate::core::model::now());
+        final_events.push(self.event(
+            self.hekate_id,
+            EventKind::AttemptCompleted,
+            Some(EntityRef::new(
+                EntityKind::Attempt,
+                completed_attempt.id.uuid(),
+            )),
+            &completed_attempt,
+            correlation_id.clone(),
+            Some(decision_event.event_id),
+        )?);
 
         let mut indexed_events = vec![observation_event];
         indexed_events.extend(final_events.iter().cloned());
@@ -548,6 +732,33 @@ impl Engine {
             operation_id: planned_operation,
             approval_id: requested_approval,
         })
+    }
+
+    async fn complete_attempt(
+        &self,
+        attempt: &Attempt,
+        status: AttemptStatus,
+    ) -> Result<(), EngineError> {
+        let state = self.storage.load_state().await?;
+        let Some(current) = state.attempts.get(&attempt.id) else {
+            return Ok(());
+        };
+        if !matches!(current.status, AttemptStatus::Started) {
+            return Ok(());
+        }
+        let mut completed = current.clone();
+        completed.status = status;
+        completed.finished_at = Some(crate::core::model::now());
+        let event = self.event(
+            self.user_id,
+            EventKind::AttemptCompleted,
+            Some(EntityRef::new(EntityKind::Attempt, completed.id.uuid())),
+            &completed,
+            None,
+            None,
+        )?;
+        self.projector.record(event).await?;
+        Ok(())
     }
 
     pub fn authorize(
@@ -1482,27 +1693,12 @@ impl Engine {
             started_at: crate::core::model::now(),
             completed_at: None,
         };
-        self.append(
-            self.user_id,
-            EventKind::RunStarted,
-            Some(EntityRef::new(EntityKind::Run, run.id.uuid())),
-            &run,
-            Some(observation.id.to_string()),
-        )
-        .await?;
-        let attempt = Attempt {
-            id: crate::core::AttemptId::new(),
-            run_id: run.id,
-            status: AttemptStatus::Started,
-            started_at: crate::core::model::now(),
-            finished_at: None,
-        };
         let state = self
             .append(
                 self.user_id,
-                EventKind::AttemptStarted,
-                Some(EntityRef::new(EntityKind::Attempt, attempt.id.uuid())),
-                &attempt,
+                EventKind::RunStarted,
+                Some(EntityRef::new(EntityKind::Run, run.id.uuid())),
+                &run,
                 Some(observation.id.to_string()),
             )
             .await?;

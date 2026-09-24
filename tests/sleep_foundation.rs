@@ -434,7 +434,7 @@ async fn running_sleep_resumes_and_existing_fingerprint_is_not_duplicated() {
 }
 
 #[tokio::test]
-async fn invalid_provenance_fails_without_cursor_and_foreground_defers() {
+async fn invalid_provenance_fails_without_cursor_and_open_foreground_records_do_not_defer() {
     let url = database_url("invalid");
     let store = Arc::new(SqliteStore::open(&url).await.expect("store"));
     Projector::new(store.clone())
@@ -474,6 +474,11 @@ async fn invalid_provenance_fails_without_cursor_and_foreground_defers() {
 
     let url = database_url("deferred");
     let store = Arc::new(SqliteStore::open(&url).await.expect("store"));
+    let seed = observation("sleep ignores an old foreground run and attempt");
+    Projector::new(store.clone())
+        .record(observation_event(&seed))
+        .await
+        .expect("observation seed");
     let run = hekate::core::Run {
         id: hekate::core::RunId::new(),
         task_id: None,
@@ -508,7 +513,7 @@ async fn invalid_provenance_fails_without_cursor_and_foreground_defers() {
         .await
         .expect("attempt");
     let calls = Arc::new(AtomicUsize::new(0));
-    let deferred_engine = engine(
+    let sleep_engine = engine(
         store.clone(),
         Arc::new(FakeSleepModel {
             calls: calls.clone(),
@@ -518,14 +523,19 @@ async fn invalid_provenance_fails_without_cursor_and_foreground_defers() {
         }),
         None,
     );
-    let result = deferred_engine.sleep_once().await.expect("deferred sleep");
+    let result = sleep_engine.sleep_once().await.expect("sleep");
     assert!(matches!(
         result.status,
-        hekate::runtime::SleepOnceStatus::Deferred
+        hekate::runtime::SleepOnceStatus::Completed
     ));
-    assert_eq!(calls.load(Ordering::SeqCst), 0);
-    assert!(store.state().await.expect("state").sleep_runs.is_empty());
-    deferred_engine.shutdown().await.expect("shutdown");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let state = store.state().await.expect("state");
+    assert_eq!(state.sleep_cursor, 1);
+    assert!(matches!(
+        state.attempts.values().next().expect("open attempt").status,
+        hekate::core::AttemptStatus::Started
+    ));
+    sleep_engine.shutdown().await.expect("shutdown");
 }
 
 #[tokio::test]

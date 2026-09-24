@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use std::time::Duration;
 use thiserror::Error;
 
 use crate::core::{CognitiveTrace, CurrentState, ExperienceEvent};
@@ -37,6 +38,18 @@ pub trait Storage: Send + Sync {
         cognitive_trace: Option<&CognitiveTrace>,
     ) -> Result<(), StorageError>;
     async fn record_cognitive_trace(&self, trace: &CognitiveTrace) -> Result<(), StorageError>;
+    async fn acquire_foreground_lease(
+        &self,
+        owner: &str,
+        ttl: Duration,
+    ) -> Result<bool, StorageError>;
+    async fn renew_foreground_lease(
+        &self,
+        owner: &str,
+        ttl: Duration,
+    ) -> Result<bool, StorageError>;
+    async fn release_foreground_lease(&self, owner: &str) -> Result<(), StorageError>;
+    async fn has_active_foreground_lease(&self) -> Result<bool, StorageError>;
     async fn shutdown(&self) -> Result<(), StorageError> {
         Ok(())
     }

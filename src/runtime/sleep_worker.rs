@@ -7,9 +7,7 @@ use tokio::task::JoinHandle;
 
 use crate::config::Config;
 use crate::runtime::engine::{Engine, EngineError};
-use crate::runtime::sleep::{
-    foreground_blocked, SleepOnceResult, SleepOnceStatus, SleepRuntimeError,
-};
+use crate::runtime::sleep::{SleepOnceResult, SleepOnceStatus, SleepRuntimeError};
 
 #[derive(Clone, Debug)]
 pub struct SleepWorkerConfig {
@@ -98,7 +96,7 @@ pub trait SleepService: Send + Sync {
 #[async_trait]
 impl SleepService for Engine {
     async fn foreground_active(&self) -> Result<bool, EngineError> {
-        Ok(foreground_blocked(&self.state().await?))
+        Engine::foreground_active(self).await
     }
 
     async fn sleep_once(&self) -> Result<SleepOnceResult, EngineError> {
@@ -295,6 +293,9 @@ fn failure_kind(error: &EngineError) -> &'static str {
         EngineError::StaleContext { .. } => "stale_context",
         EngineError::NotFound(_) => "not_found",
         EngineError::InvalidOperation(_) => "invalid_operation",
+        EngineError::ForegroundActivityBusy | EngineError::ForegroundActivityLeaseLost => {
+            "foreground_activity"
+        }
         EngineError::Completion(_) => "completion_error",
         EngineError::Recovery(_) => "recovery_error",
         EngineError::Integration(_) => "integration_error",

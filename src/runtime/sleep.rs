@@ -130,7 +130,7 @@ impl<'a> SleepCoordinator<'a> {
 
     pub async fn sleep_once(&self) -> Result<SleepOnceResult, SleepRuntimeError> {
         let state = self.storage.load_state().await?;
-        if foreground_blocked(&state) {
+        if self.storage.has_active_foreground_lease().await? {
             return Ok(empty_result(SleepOnceStatus::Deferred));
         }
 
@@ -189,8 +189,7 @@ impl<'a> SleepCoordinator<'a> {
                 Ok(state) => state,
                 Err(ProjectionError::StaleContext { .. })
                 | Err(ProjectionError::Storage(StorageError::StaleContext { .. })) => {
-                    let latest = self.storage.load_state().await?;
-                    if foreground_blocked(&latest) {
+                    if self.storage.has_active_foreground_lease().await? {
                         return Ok(empty_result(SleepOnceStatus::Deferred));
                     }
                     return Err(SleepRuntimeError::Invalid(
@@ -242,6 +241,12 @@ impl<'a> SleepCoordinator<'a> {
         };
         let context = built_context.context;
         let budget_report = built_context.budget_report;
+        let latest = self.storage.load_state().await?;
+        if latest.revision != state.revision || self.storage.has_active_foreground_lease().await? {
+            return self
+                .interrupt_run(run, latest, Some(budget_report.clone()))
+                .await;
+        }
         let deliberation = match self
             .model
             .expect("sleep model checked above")
@@ -252,7 +257,9 @@ impl<'a> SleepCoordinator<'a> {
             Err(error) => {
                 self.record_trace(error.trace()).await;
                 let latest = self.storage.load_state().await?;
-                if latest.revision != state.revision || foreground_blocked(&latest) {
+                if latest.revision != state.revision
+                    || self.storage.has_active_foreground_lease().await?
+                {
                     return self
                         .interrupt_run(run, latest, Some(budget_report.clone()))
                         .await;
@@ -264,7 +271,7 @@ impl<'a> SleepCoordinator<'a> {
         };
 
         let latest = self.storage.load_state().await?;
-        if latest.revision != state.revision || foreground_blocked(&latest) {
+        if latest.revision != state.revision || self.storage.has_active_foreground_lease().await? {
             return self
                 .interrupt_run(run, latest, Some(budget_report.clone()))
                 .await;
@@ -701,24 +708,6 @@ fn empty_result(status: SleepOnceStatus) -> SleepOnceResult {
         resumed: false,
         error_kind: None,
     }
-}
-
-pub(crate) fn foreground_blocked(state: &crate::core::CurrentState) -> bool {
-    state.active_run().is_some()
-        || state
-            .attempts
-            .values()
-            .any(|attempt| matches!(attempt.status, crate::core::AttemptStatus::Started))
-        || state
-            .approvals
-            .values()
-            .any(|approval| matches!(approval.status, crate::core::ApprovalStatus::Pending))
-        || state.operations.values().any(|operation| {
-            matches!(
-                operation.status,
-                crate::core::OperationStatus::Started | crate::core::OperationStatus::Unknown
-            )
-        })
 }
 
 fn serialized_len<T: Serialize>(value: &T) -> Result<usize, serde_json::Error> {

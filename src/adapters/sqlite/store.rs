@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use serde::Serialize;
 use serde_json::Value;
 use sqlx::{Row, Sqlite, Transaction};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -246,10 +247,98 @@ impl Storage for SqliteStore {
         Ok(())
     }
 
+    async fn acquire_foreground_lease(
+        &self,
+        owner: &str,
+        ttl: Duration,
+    ) -> Result<bool, StorageError> {
+        let now = unix_time_ms();
+        let expires = lease_deadline(now, ttl);
+        let mut transaction = self
+            .database
+            .pool()
+            .begin()
+            .await
+            .map_err(|error| StorageError::Backend(error.to_string()))?;
+        sqlx::query("DELETE FROM foreground_leases WHERE expires_at_ms <= ?")
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| StorageError::Backend(error.to_string()))?;
+        let result = sqlx::query(
+            "INSERT INTO foreground_leases (owner_id, expires_at_ms) VALUES (?, ?) \
+             ON CONFLICT(owner_id) DO NOTHING",
+        )
+        .bind(owner)
+        .bind(expires)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| StorageError::Backend(error.to_string()))?;
+        transaction
+            .commit()
+            .await
+            .map_err(|error| StorageError::Backend(error.to_string()))?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn renew_foreground_lease(
+        &self,
+        owner: &str,
+        ttl: Duration,
+    ) -> Result<bool, StorageError> {
+        let now = unix_time_ms();
+        let result = sqlx::query(
+            "UPDATE foreground_leases SET expires_at_ms = ? \
+             WHERE owner_id = ? AND expires_at_ms > ?",
+        )
+        .bind(lease_deadline(now, ttl))
+        .bind(owner)
+        .bind(now)
+        .execute(self.database.pool())
+        .await
+        .map_err(|error| StorageError::Backend(error.to_string()))?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn release_foreground_lease(&self, owner: &str) -> Result<(), StorageError> {
+        sqlx::query("DELETE FROM foreground_leases WHERE owner_id = ?")
+            .bind(owner)
+            .execute(self.database.pool())
+            .await
+            .map_err(|error| StorageError::Backend(error.to_string()))?;
+        Ok(())
+    }
+
+    async fn has_active_foreground_lease(&self) -> Result<bool, StorageError> {
+        let row = sqlx::query(
+            "SELECT EXISTS(SELECT 1 FROM foreground_leases WHERE expires_at_ms > ?) AS active",
+        )
+        .bind(unix_time_ms())
+        .fetch_one(self.database.pool())
+        .await
+        .map_err(|error| StorageError::Backend(error.to_string()))?;
+        let active: i64 = row
+            .try_get("active")
+            .map_err(|error| StorageError::Backend(error.to_string()))?;
+        Ok(active != 0)
+    }
+
     async fn shutdown(&self) -> Result<(), StorageError> {
         self.database.close().await;
         Ok(())
     }
+}
+
+fn unix_time_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
+}
+
+fn lease_deadline(now: i64, ttl: Duration) -> i64 {
+    now.saturating_add(ttl.as_millis().min(i64::MAX as u128) as i64)
 }
 
 async fn write_cognitive_trace(
