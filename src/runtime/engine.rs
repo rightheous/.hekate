@@ -730,6 +730,17 @@ impl Engine {
         CompletionGate::new(self.storage.clone())
     }
 
+    pub async fn complete_task(
+        &self,
+        task_id: TaskId,
+        expected_revision: u64,
+    ) -> Result<Task, EngineError> {
+        Ok(self
+            .completion_gate()
+            .complete_task(self.user_id, task_id, expected_revision)
+            .await?)
+    }
+
     pub async fn define_completion_criterion(
         &self,
         task_id: TaskId,

@@ -49,6 +49,8 @@ pub struct Cli {
     pub tasks: bool,
     #[arg(long, value_name = "TASK_ID")]
     pub completion_status: Option<String>,
+    #[arg(long, value_name = "TASK_ID")]
+    pub complete_task: Option<String>,
     #[arg(long)]
     pub completion_claims: bool,
     #[arg(long)]
@@ -544,6 +546,53 @@ fn validate_completion_args(cli: &Cli) -> anyhow::Result<()> {
     {
         anyhow::bail!("completion queries cannot be combined with MESSAGE or --message-id")
     }
+    if cli.complete_task.is_some()
+        && [
+            cli.chat,
+            cli.thread_id.is_some(),
+            cli.message_id.is_some(),
+            !cli.message.is_empty(),
+            cli.inspect,
+            cli.identity,
+            cli.positions,
+            cli.conflicts,
+            cli.goals,
+            cli.tasks,
+            cli.completion_status.is_some(),
+            cli.completion_claims,
+            cli.runs,
+            cli.pending,
+            cli.resume,
+            cli.memory_list,
+            cli.response_profile,
+            cli.embedding_status,
+            cli.embedding_index_once,
+            cli.embedding_search.is_some(),
+            cli.sleep_once,
+            cli.sleep_status,
+            cli.sleep_worker,
+            cli.integration_candidates,
+            cli.verify_integration.is_some(),
+            cli.reject_integration.is_some(),
+            cli.integrate_memory.is_some(),
+            cli.integrate_position.is_some(),
+            cli.integration_reason.is_some(),
+            cli.memory_candidate.is_some(),
+            cli.memory_kind.is_some(),
+            cli.memory_confidence.is_some(),
+            cli.promote_memory.is_some(),
+            cli.reject_memory.is_some(),
+            cli.supersede_memory.is_some(),
+            cli.expire_memory.is_some(),
+            cli.approve.is_some(),
+            cli.deny.is_some(),
+            cli.execute.is_some(),
+        ]
+        .into_iter()
+        .any(|selected| selected)
+    {
+        anyhow::bail!("--complete-task cannot be combined with another command or MESSAGE")
+    }
     Ok(())
 }
 
@@ -588,6 +637,14 @@ async fn run_embedding_command(config: &Config, cli: &Cli) -> anyhow::Result<()>
 }
 
 async fn run_command(engine: &Engine, cli: &Cli) -> anyhow::Result<()> {
+    if let Some(id) = &cli.complete_task {
+        let expected_revision = engine.state().await?.revision;
+        let task = engine
+            .complete_task(parse_id(id)?, expected_revision)
+            .await?;
+        println!("{}", serde_json::to_string_pretty(&task)?);
+        return Ok(());
+    }
     if cli.integration_candidates {
         let candidates = engine
             .list_integration_candidates()

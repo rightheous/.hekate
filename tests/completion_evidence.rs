@@ -157,6 +157,83 @@ async fn claim_lifecycle_requires_provenance_and_replays() -> Result<(), Box<dyn
 }
 
 #[tokio::test]
+async fn task_completion_requires_ready_gate_and_is_retry_safe(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let store = Arc::new(SqliteStore::open(&database_url("task-completion")).await?);
+    let (actor, task, source_event, source_sequence) = task_and_source(&store).await;
+    let gate = CompletionGate::new(store.clone());
+    let criterion = gate
+        .define_criterion(actor, task.id, "source was checked", true)
+        .await?;
+
+    let before = store.state().await?;
+    let event_count = store.events().await?.len();
+    assert!(matches!(
+        gate.complete_task(actor, task.id, before.revision).await,
+        Err(CompletionError::GateBlocked {
+            gate: CompletionGateResult::Blocked {
+                missing_criterion_ids,
+                ..
+            }
+        }) if missing_criterion_ids == vec![criterion.id]
+    ));
+    assert_eq!(store.events().await?.len(), event_count);
+    assert_eq!(
+        store.state().await?.tasks[&task.id].status,
+        TaskStatus::InProgress
+    );
+
+    gate.create_claim(
+        actor,
+        task.id,
+        criterion.id,
+        100,
+        vec![EvidenceRef {
+            event_id: source_event.event_id,
+            artifact_id: None,
+            source_hash: source_event.integrity_hash.clone(),
+            as_of_sequence: source_sequence,
+        }],
+        None,
+        None,
+    )
+    .await?;
+    let claim = store
+        .state()
+        .await?
+        .completion_claims
+        .values()
+        .next()
+        .expect("claim")
+        .clone();
+    gate.verify_claim(actor, claim.id, "human checked source")
+        .await?;
+
+    let completion_revision = store.state().await?.revision;
+    let completed = gate
+        .complete_task(actor, task.id, completion_revision)
+        .await?;
+    assert_eq!(completed.status, TaskStatus::Completed);
+    let state = store.state().await?;
+    assert_eq!(state.tasks[&task.id].status, TaskStatus::Completed);
+
+    let retried = gate
+        .complete_task(actor, task.id, completion_revision)
+        .await?;
+    assert_eq!(retried, completed);
+    let events = store.events().await?;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_kind == EventKind::TaskCompleted)
+            .count(),
+        1
+    );
+    assert_eq!(state, Projector::replay(&events)?);
+    Ok(())
+}
+
+#[tokio::test]
 async fn structural_completion_blockers_prevent_verified_or_completed_state(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(SqliteStore::open(&database_url("blockers")).await?);

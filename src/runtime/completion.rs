@@ -4,11 +4,12 @@ use std::sync::Arc;
 use serde::Serialize;
 use thiserror::Error;
 
+use crate::core::transition::transition_task;
 use crate::core::{
     completion_fingerprint, normalize_description, normalize_evidence_refs, ArtifactId,
     CompletionClaim, CompletionClaimId, CompletionClaimTransition, CompletionCriterion,
     CompletionCriterionId, CurrentState, EntityKind, EntityRef, EventId, EventKind, EventSource,
-    EvidenceRef, ExperienceEvent, TaskId, VerificationDisposition,
+    EvidenceRef, ExperienceEvent, Task, TaskId, TaskStatus, VerificationDisposition,
 };
 use crate::ports::{Storage, StorageError};
 use crate::runtime::projector::{ProjectionError, Projector};
@@ -70,6 +71,10 @@ pub enum CompletionError {
     ModelCannotVerify,
     #[error("stale revision: expected {expected}, actual {actual}")]
     StaleRevision { expected: u64, actual: u64 },
+    #[error("task completion blocked: {gate:?}")]
+    GateBlocked { gate: CompletionGateResult },
+    #[error(transparent)]
+    Transition(#[from] crate::core::transition::TransitionError),
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]
@@ -265,99 +270,53 @@ impl CompletionGate {
     ) -> Result<CompletionGateResult, CompletionError> {
         let events = self.storage.load_events().await?;
         let state = state_as_of(&events, as_of_sequence)?;
+        evaluate_task_completion_in(&state, &events[..as_of_sequence as usize], task_id)
+    }
+
+    pub async fn complete_task(
+        &self,
+        actor_id: crate::core::PrincipalId,
+        task_id: TaskId,
+        expected_revision: u64,
+    ) -> Result<Task, CompletionError> {
+        let events = self.storage.load_events().await?;
+        let state = Projector::replay(&events)?;
         ensure_task(&state, task_id)?;
-        let latest_claims = latest_claims(&events[..as_of_sequence as usize])?;
-        let mut missing = Vec::new();
-        let mut needs_validation = Vec::new();
-        let mut rejected = Vec::new();
-        let mut blockers = Vec::new();
-        let mut verified = Vec::new();
-
-        for criterion in state
-            .completion_criteria
-            .values()
-            .filter(|criterion| criterion.task_id == task_id && criterion.required)
-        {
-            let claim = latest_claims
-                .get(&criterion.id)
-                .and_then(|claim_id| state.completion_claims.get(claim_id));
-            let Some(claim) = claim else {
-                missing.push(criterion.id);
-                blockers.push(format!("criterion {} has no active claim", criterion.id));
-                continue;
-            };
-            match claim.disposition {
-                VerificationDisposition::NeedsValidation => {
-                    needs_validation.push(claim.id);
-                    blockers.push(format!("claim {} needs validation", claim.id));
-                }
-                VerificationDisposition::Rejected => {
-                    rejected.push(claim.id);
-                    blockers.push(format!("claim {} was rejected", claim.id));
-                }
-                VerificationDisposition::Verified => {
-                    if let Some(blocker) = claim.blocker.as_deref().and_then(trimmed_non_empty) {
-                        blockers.push(blocker);
-                        continue;
-                    }
-                    if let Err(error) = validate_evidence_refs(
-                        &state,
-                        &events[..as_of_sequence as usize],
-                        &claim.evidence_refs,
-                        claim.as_of_sequence,
-                    ) {
-                        blockers.push(error.to_string());
-                        continue;
-                    }
-                    verified.push(claim.id);
-                }
-            }
+        ensure_non_model_actor(&state, actor_id)?;
+        let current = state
+            .tasks
+            .get(&task_id)
+            .cloned()
+            .ok_or(CompletionError::UnknownTask(task_id))?;
+        if matches!(&current.status, TaskStatus::Completed) {
+            return Ok(current);
+        }
+        if expected_revision != state.revision {
+            return Err(CompletionError::StaleRevision {
+                expected: expected_revision,
+                actual: state.revision,
+            });
         }
 
-        let pending_approval_ids = state
-            .approvals
-            .values()
-            .filter(|approval| matches!(approval.status, crate::core::ApprovalStatus::Pending))
-            .map(|approval| approval.id)
-            .collect::<Vec<_>>();
-        let unknown_operation_ids = state
-            .operations
-            .values()
-            .filter(|operation| {
-                matches!(
-                    operation.status,
-                    crate::core::OperationStatus::Started | crate::core::OperationStatus::Unknown
-                )
-            })
-            .map(|operation| operation.id)
-            .collect::<Vec<_>>();
-        for approval_id in &pending_approval_ids {
-            blockers.push(format!("approval {approval_id} is pending"));
-        }
-        for operation_id in &unknown_operation_ids {
-            blockers.push(format!("operation {operation_id} has unknown effect state"));
+        let gate = evaluate_task_completion_in(&state, &events, task_id)?;
+        if !matches!(gate, CompletionGateResult::Ready { .. }) {
+            return Err(CompletionError::GateBlocked { gate });
         }
 
-        if missing.is_empty()
-            && needs_validation.is_empty()
-            && rejected.is_empty()
-            && blockers.is_empty()
-            && pending_approval_ids.is_empty()
-            && unknown_operation_ids.is_empty()
-        {
-            Ok(CompletionGateResult::Ready {
-                verified_claim_ids: verified,
-            })
-        } else {
-            Ok(CompletionGateResult::Blocked {
-                missing_criterion_ids: missing,
-                needs_validation_claim_ids: needs_validation,
-                rejected_claim_ids: rejected,
-                blockers,
-                pending_approval_ids,
-                unknown_operation_ids,
-            })
-        }
+        let mut completed = current;
+        transition_task(&mut completed, TaskStatus::Completed)?;
+        let event = completion_event(
+            actor_id,
+            EventKind::TaskCompleted,
+            EntityKind::Task,
+            task_id.uuid(),
+            &completed,
+            Some(task_id.to_string()),
+            None,
+            None,
+        )?;
+        self.commit(state.revision, event).await?;
+        Ok(completed)
     }
 
     pub async fn status(
@@ -383,9 +342,8 @@ impl CompletionGate {
                     .cloned(),
             })
             .collect();
-        let gate = self
-            .evaluate_task_completion(task_id, as_of_sequence)
-            .await?;
+        let gate =
+            evaluate_task_completion_in(&state, &events[..as_of_sequence as usize], task_id)?;
         Ok(CompletionStatusReport {
             task_id,
             as_of_sequence,
@@ -482,6 +440,123 @@ impl CompletionGate {
             }
             Err(error) => Err(CompletionError::Projection(error)),
         }
+    }
+}
+
+fn evaluate_task_completion_in(
+    state: &CurrentState,
+    events: &[ExperienceEvent],
+    task_id: TaskId,
+) -> Result<CompletionGateResult, CompletionError> {
+    ensure_task(state, task_id)?;
+    let latest_claims = latest_claims(events)?;
+    let mut missing = Vec::new();
+    let mut needs_validation = Vec::new();
+    let mut rejected = Vec::new();
+    let mut blockers = Vec::new();
+    let mut verified = Vec::new();
+
+    for criterion in state
+        .completion_criteria
+        .values()
+        .filter(|criterion| criterion.task_id == task_id && criterion.required)
+    {
+        let claim = latest_claims
+            .get(&criterion.id)
+            .and_then(|claim_id| state.completion_claims.get(claim_id));
+        let Some(claim) = claim else {
+            missing.push(criterion.id);
+            blockers.push(format!("criterion {} has no active claim", criterion.id));
+            continue;
+        };
+        match claim.disposition {
+            VerificationDisposition::NeedsValidation => {
+                needs_validation.push(claim.id);
+                blockers.push(format!("claim {} needs validation", claim.id));
+            }
+            VerificationDisposition::Rejected => {
+                rejected.push(claim.id);
+                blockers.push(format!("claim {} was rejected", claim.id));
+            }
+            VerificationDisposition::Verified => {
+                if let Some(blocker) = claim.blocker.as_deref().and_then(trimmed_non_empty) {
+                    blockers.push(blocker);
+                    continue;
+                }
+                if claim.evidence_refs.is_empty() {
+                    blockers.push(format!("claim {} has no evidence", claim.id));
+                    continue;
+                }
+                if claim.fingerprint
+                    != completion_fingerprint(
+                        claim.task_id,
+                        claim.criterion_id,
+                        &claim.evidence_refs,
+                    )
+                {
+                    blockers.push(format!(
+                        "claim {} fingerprint does not match its evidence",
+                        claim.id
+                    ));
+                    continue;
+                }
+                if let Err(error) = validate_evidence_refs(
+                    state,
+                    events,
+                    &claim.evidence_refs,
+                    claim.as_of_sequence,
+                ) {
+                    blockers.push(error.to_string());
+                    continue;
+                }
+                verified.push(claim.id);
+            }
+        }
+    }
+
+    let pending_approval_ids = state
+        .approvals
+        .values()
+        .filter(|approval| matches!(approval.status, crate::core::ApprovalStatus::Pending))
+        .map(|approval| approval.id)
+        .collect::<Vec<_>>();
+    let unknown_operation_ids = state
+        .operations
+        .values()
+        .filter(|operation| {
+            matches!(
+                operation.status,
+                crate::core::OperationStatus::Started | crate::core::OperationStatus::Unknown
+            )
+        })
+        .map(|operation| operation.id)
+        .collect::<Vec<_>>();
+    for approval_id in &pending_approval_ids {
+        blockers.push(format!("approval {approval_id} is pending"));
+    }
+    for operation_id in &unknown_operation_ids {
+        blockers.push(format!("operation {operation_id} has unknown effect state"));
+    }
+
+    if missing.is_empty()
+        && needs_validation.is_empty()
+        && rejected.is_empty()
+        && blockers.is_empty()
+        && pending_approval_ids.is_empty()
+        && unknown_operation_ids.is_empty()
+    {
+        Ok(CompletionGateResult::Ready {
+            verified_claim_ids: verified,
+        })
+    } else {
+        Ok(CompletionGateResult::Blocked {
+            missing_criterion_ids: missing,
+            needs_validation_claim_ids: needs_validation,
+            rejected_claim_ids: rejected,
+            blockers,
+            pending_approval_ids,
+            unknown_operation_ids,
+        })
     }
 }
 

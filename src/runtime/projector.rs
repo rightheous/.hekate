@@ -3,6 +3,7 @@ use std::sync::Arc;
 use serde::de::DeserializeOwned;
 use thiserror::Error;
 
+use crate::core::transition::transition_task;
 use crate::core::{
     ActiveMemory, Approval, Attempt, CognitiveTrace, Commitment, CompletionClaim,
     CompletionClaimTransition, CompletionCriterion, Conflict, ConflictStatus, CurrentState,
@@ -11,7 +12,7 @@ use crate::core::{
     Position, PositionIntegrationActionKind, PositionIntegrationEventPayload,
     PositionIntegrationMaterialization, PositionIntegrationOperation, PositionIntegrationProposal,
     PositionStatus, Principal, Receipt, Relationship, Run, SleepRun, SleepRunStatus, Task,
-    Verification, VerificationDisposition, VerificationStatus, WorkingState,
+    TaskStatus, Verification, VerificationDisposition, VerificationStatus, WorkingState,
 };
 use crate::ports::{Storage, StorageError};
 use crate::runtime::deliberation::validate_position_revision;
@@ -98,6 +99,7 @@ impl Projector {
             }
             EventKind::GoalCreated => insert(&event.event_kind, &event.payload, &mut state.goals)?,
             EventKind::TaskCreated => insert(&event.event_kind, &event.payload, &mut state.tasks)?,
+            EventKind::TaskCompleted => apply_task_completion(state, event)?,
             EventKind::RunStarted | EventKind::RunSuspended | EventKind::RunCompleted => {
                 insert(&event.event_kind, &event.payload, &mut state.runs)?
             }
@@ -333,6 +335,31 @@ impl Projector {
         state.applied_events.push(event.event_id);
         Ok(())
     }
+}
+
+fn apply_task_completion(
+    state: &mut CurrentState,
+    event: &ExperienceEvent,
+) -> Result<(), ProjectionError> {
+    let completed: Task = payload(event)?;
+    if event.subject.as_ref().map(|subject| {
+        subject.kind == crate::core::EntityKind::Task && subject.id == completed.id.uuid()
+    }) != Some(true)
+    {
+        return invalid(
+            &event.event_kind,
+            "task completion subject does not match payload",
+        );
+    }
+    let Some(current) = state.tasks.get(&completed.id) else {
+        return invalid(&event.event_kind, "completion references an unknown task");
+    };
+    let mut expected = current.clone();
+    if transition_task(&mut expected, TaskStatus::Completed).is_err() || expected != completed {
+        return invalid(&event.event_kind, "invalid task completion transition");
+    }
+    state.tasks.insert(completed.id, completed);
+    Ok(())
 }
 
 fn apply_position_event(

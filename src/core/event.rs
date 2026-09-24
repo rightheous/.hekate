@@ -13,6 +13,7 @@ pub enum EventKind {
     ObservationRecorded,
     GoalCreated,
     TaskCreated,
+    TaskCompleted,
     RunStarted,
     RunSuspended,
     RunCompleted,
