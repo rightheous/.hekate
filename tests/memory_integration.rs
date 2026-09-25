@@ -585,6 +585,21 @@ fn context_engine(
     )
 }
 
+fn write_eval_rows(
+    filename: &str,
+    records: &[serde_json::Value],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = std::path::Path::new("target/hekate-evals").join(filename);
+    fs::create_dir_all(path.parent().expect("eval parent"))?;
+    let jsonl = records
+        .iter()
+        .map(serde_json::Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(path, format!("{jsonl}\n"))?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn verifies_materializes_replays_and_survives_embedding_failure(
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -653,89 +668,119 @@ async fn verifies_materializes_replays_and_survives_embedding_failure(
 #[tokio::test]
 async fn rejects_bad_evidence_and_never_materializes_failed_transitions(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (store, memory_id, position_id, source_event_id) = fixture().await?;
-    let config = Config::default();
-    let engine = engine(store.clone(), None);
-    let state = store.state().await?;
-    let source_hash = store
-        .events()
-        .await?
-        .into_iter()
-        .find(|event| event.event_id == source_event_id)
-        .expect("source event")
-        .integrity_hash;
-    let candidate = state.integration_candidates[&memory_id].clone();
-    let outside = EvidenceRef {
-        event_id: hekate::core::EventId::new(),
-        artifact_id: None,
-        source_hash: source_hash.clone(),
-        as_of_sequence: candidate.as_of_revision,
-    };
-    assert!(matches!(
-        engine
-            .verify_integration_candidate_with_evidence(
-                memory_id,
-                config.user_principal_id,
-                "human checked",
-                vec![outside],
-            )
-            .await,
-        Err(EngineError::Integration(
-            IntegrationError::EvidenceOutsideCandidate(_)
-        ))
-    ));
-    let future = EvidenceRef {
-        event_id: source_event_id,
-        artifact_id: None,
-        source_hash,
-        as_of_sequence: candidate.as_of_revision + 1,
-    };
-    assert!(matches!(
-        engine
-            .verify_integration_candidate_with_evidence(
-                memory_id,
-                config.user_principal_id,
-                "human checked",
-                vec![future],
-            )
-            .await,
-        Err(EngineError::Integration(
-            IntegrationError::FutureEvidenceSequence { .. }
-        ))
-    ));
-    assert!(matches!(
-        engine
-            .verify_integration_candidate(memory_id, config.user_principal_id, "  ")
-            .await,
-        Err(EngineError::Integration(IntegrationError::InvalidReason))
-    ));
-    let rejected = engine
-        .reject_integration_candidate(memory_id, config.user_principal_id, "not supported")
-        .await?;
-    assert_eq!(rejected.disposition, VerificationDisposition::Rejected);
-    assert!(matches!(
-        engine.integrate_memory(memory_id).await,
-        Err(EngineError::Integration(IntegrationError::CandidateNotVerified(id))) if id == memory_id
-    ));
+    let mut eval_rows = Vec::new();
+    for iteration in 1..=10 {
+        let (store, memory_id, position_id, source_event_id) = fixture().await?;
+        let config = Config::default();
+        let engine = engine(store.clone(), None);
+        let state = store.state().await?;
+        let source_hash = store
+            .events()
+            .await?
+            .into_iter()
+            .find(|event| event.event_id == source_event_id)
+            .expect("source event")
+            .integrity_hash;
+        let candidate = state.integration_candidates[&memory_id].clone();
+        let outside = EvidenceRef {
+            event_id: hekate::core::EventId::new(),
+            artifact_id: None,
+            source_hash: source_hash.clone(),
+            as_of_sequence: candidate.as_of_revision,
+        };
+        assert!(matches!(
+            engine
+                .verify_integration_candidate_with_evidence(
+                    memory_id,
+                    config.user_principal_id,
+                    "human checked",
+                    vec![outside],
+                )
+                .await,
+            Err(EngineError::Integration(
+                IntegrationError::EvidenceOutsideCandidate(_)
+            ))
+        ));
+        let future = EvidenceRef {
+            event_id: source_event_id,
+            artifact_id: None,
+            source_hash,
+            as_of_sequence: candidate.as_of_revision + 1,
+        };
+        assert!(matches!(
+            engine
+                .verify_integration_candidate_with_evidence(
+                    memory_id,
+                    config.user_principal_id,
+                    "human checked",
+                    vec![future],
+                )
+                .await,
+            Err(EngineError::Integration(
+                IntegrationError::FutureEvidenceSequence { .. }
+            ))
+        ));
+        assert!(matches!(
+            engine
+                .verify_integration_candidate(memory_id, config.user_principal_id, "  ")
+                .await,
+            Err(EngineError::Integration(IntegrationError::InvalidReason))
+        ));
+        let rejected = engine
+            .reject_integration_candidate(memory_id, config.user_principal_id, "not supported")
+            .await?;
+        assert_eq!(rejected.disposition, VerificationDisposition::Rejected);
+        assert!(matches!(
+            engine.integrate_memory(memory_id).await,
+            Err(EngineError::Integration(IntegrationError::CandidateNotVerified(id))) if id == memory_id
+        ));
 
-    let verified_position = engine
-        .verify_integration_candidate(position_id, config.user_principal_id, "human checked")
-        .await?;
-    assert_eq!(
-        verified_position.disposition,
-        VerificationDisposition::Verified
-    );
-    assert!(matches!(
-        engine.integrate_memory(position_id).await,
-        Err(EngineError::Integration(
-            IntegrationError::UnsupportedCandidateKind(IntegrationCandidateKind::Position)
-        ))
-    ));
-    let state = store.state().await?;
-    assert!(state.memory_candidates.is_empty());
-    assert!(state.active_memories.is_empty());
-    assert_eq!(Projector::replay(&store.events().await?)?, state);
-    engine.shutdown().await?;
+        let verified_position = engine
+            .verify_integration_candidate(position_id, config.user_principal_id, "human checked")
+            .await?;
+        assert_eq!(
+            verified_position.disposition,
+            VerificationDisposition::Verified
+        );
+        assert!(matches!(
+            engine.integrate_memory(position_id).await,
+            Err(EngineError::Integration(
+                IntegrationError::UnsupportedCandidateKind(IntegrationCandidateKind::Position)
+            ))
+        ));
+        let state = store.state().await?;
+        assert!(state.memory_candidates.is_empty());
+        assert!(state.active_memories.is_empty());
+        let events = store.events().await?;
+        let replay_verified = Projector::replay(&events)? == state;
+        assert!(replay_verified);
+        eval_rows.push(serde_json::json!({
+            "scenario": "rejected_or_invalid_candidate_stays_inactive",
+            "iteration": iteration,
+            "input": "candidate evidence is outside, future, unsupported, or rejected",
+            "as_of_revision": candidate.as_of_revision,
+            "source_event_ids": candidate.source_event_ids,
+            "counterevidence_event_ids": candidate.counterevidence_event_ids,
+            "active_before": [],
+            "active_after": state.active_memories.values()
+                .filter(|item| item.status == ActiveMemoryStatus::Active)
+                .map(|item| serde_json::json!({"id": item.id, "content": item.content}))
+                .collect::<Vec<_>>(),
+            "cursor_before": state.sleep_cursor,
+            "cursor_after": state.sleep_cursor,
+            "result": "passed",
+            "projection_verified": replay_verified,
+            "external_capability_executed": false,
+        }));
+        engine.shutdown().await?;
+    }
+    write_eval_rows("consolidation-rejection.jsonl", &eval_rows)?;
+    assert_eq!(eval_rows.len(), 10);
+    assert!(eval_rows.iter().all(|record| {
+        record["result"] == "passed"
+            && record["projection_verified"] == true
+            && record["external_capability_executed"] == false
+    }));
     Ok(())
 }
 
@@ -743,243 +788,252 @@ async fn rejects_bad_evidence_and_never_materializes_failed_transitions(
 async fn verified_memory_revision_replaces_expires_and_replays(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut eval_rows = Vec::new();
-    for iteration in 1..=10 {
-        let (store, initial_id, _, original_source_id) = fixture().await?;
-        let config = Config::default();
-        let engine = engine(store.clone(), None);
-        engine
-            .verify_integration_candidate(initial_id, config.user_principal_id, "human checked")
-            .await?;
-        let hekate::runtime::MemoryIntegrationResult::Created {
-            memory_candidate: original_candidate,
-            memory: original_memory,
-            ..
-        } = engine.integrate_memory(initial_id).await?
-        else {
-            panic!("plain Memory must retain the legacy creation path")
-        };
-        let follow_up = "What does the durable memory source say?";
-        let before_seen = Arc::new(Mutex::new(Vec::new()));
-        let before_result = context_engine(store.clone(), before_seen.clone())
-            .handle(Observation {
-                id: ObservationId::new(),
-                actor_id: config.user_principal_id,
-                content: follow_up.to_owned(),
-                source_type: "test".to_owned(),
-                source_ref: None,
-                thread_id: None,
-                message_id: None,
-                received_at: now(),
-            })
-            .await?;
-        let before_context = before_seen
-            .lock()
-            .expect("before context capture")
-            .last()
-            .cloned()
-            .expect("before context");
-        let before_memory = before_context
-            .recall
-            .items
-            .iter()
-            .find(|item| item.entity.kind == EntityKind::Memory)
-            .expect("original Memory in model recall");
-        assert_eq!(before_memory.entity.id, original_memory.id.uuid());
-        let before_middle = before_context
-            .context_snapshot
-            .as_ref()
-            .expect("before context snapshot")["compressed_middle"]
-            .as_array()
-            .expect("middle items");
-        assert!(before_middle
-            .iter()
-            .any(|item| item["entity"]["id"] == original_memory.id.to_string()));
-        let original_events = store.events().await?;
-        let original_memory_event = original_events
-            .iter()
-            .find(|event| {
-                event.event_kind == EventKind::MemoryPromoted
-                    && event.subject.as_ref().is_some_and(|subject| {
-                        subject.kind == EntityKind::Memory
-                            && subject.id == original_memory.id.uuid()
-                    })
-            })
-            .expect("original Memory source event")
-            .clone();
-        let (replace_id, replace_source_id) = memory_revision_candidate(
-            &store,
-            config.user_principal_id,
-            original_memory.id,
-            original_memory_event.event_id,
-            original_memory_event.canonical_hash()?,
-            Some("new memory claim after contradictory evidence"),
-        )
-        .await?;
-        let pending = store.state().await?;
-        assert_eq!(
-            pending.active_memories[&original_memory.id].status,
-            ActiveMemoryStatus::Active
-        );
-        assert_eq!(
-            pending.integration_candidates[&replace_id].disposition,
-            VerificationDisposition::NeedsValidation
-        );
-        assert!(pending.memory_revision_materializations.is_empty());
-        assert!(pending.integration_candidates[&replace_id]
-            .counterevidence_event_ids
-            .contains(&original_memory_event.event_id));
-        engine
-            .verify_integration_candidate(replace_id, config.user_principal_id, "human checked")
-            .await?;
-        let hekate::runtime::MemoryIntegrationResult::Replaced {
-            memory_candidate: replacement_candidate,
-            memory: replacement,
-            previous_memory,
-            materialization: replacement_materialization,
-        } = engine.integrate_memory(replace_id).await?
-        else {
-            panic!("typed replace proposal should replace the Memory")
-        };
-        assert_eq!(previous_memory.status, ActiveMemoryStatus::Superseded);
-        assert_eq!(replacement.supersedes, Some(original_memory.id));
-        assert_eq!(
-            replacement_candidate.supersedes,
-            Some(original_candidate.id)
-        );
-        assert_eq!(
-            replacement_materialization.source_event_ids,
-            vec![replace_source_id]
-        );
-        let after_seen = Arc::new(Mutex::new(Vec::new()));
-        let after_result = context_engine(store.clone(), after_seen.clone())
-            .handle(Observation {
-                id: ObservationId::new(),
-                actor_id: config.user_principal_id,
-                content: follow_up.to_owned(),
-                source_type: "test".to_owned(),
-                source_ref: None,
-                thread_id: None,
-                message_id: None,
-                received_at: now(),
-            })
-            .await?;
-        let after_context = after_seen
-            .lock()
-            .expect("after context capture")
-            .last()
-            .cloned()
-            .expect("after context");
-        let after_memory = after_context
-            .recall
-            .items
-            .iter()
-            .find(|item| item.entity.kind == EntityKind::Memory)
-            .expect("replacement Memory in model recall");
-        assert_eq!(after_memory.entity.id, replacement.id.uuid());
-        assert_eq!(after_memory.text, replacement.content);
-        assert_ne!(
-            before_result.decision.message,
-            after_result.decision.message
-        );
-        let after_middle = after_context
-            .context_snapshot
-            .as_ref()
-            .expect("after context snapshot")["compressed_middle"]
-            .as_array()
-            .expect("middle items");
-        assert!(after_middle
-            .iter()
-            .any(|item| item["entity"]["id"] == replacement.id.to_string()));
-        assert!(!after_middle
-            .iter()
-            .any(|item| item["entity"]["id"] == original_memory.id.to_string()));
-        let event_count_after_replace = store.events().await?.len();
-        assert!(matches!(
-            engine.integrate_memory(replace_id).await,
-            Err(EngineError::Integration(IntegrationError::AlreadyMaterialized(id))) if id == replace_id
-        ));
-        assert_eq!(store.events().await?.len(), event_count_after_replace);
-
-        let replacement_event = store
-            .events()
-            .await?
-            .into_iter()
-            .find(|event| {
-                event.event_kind == EventKind::MemoryPromoted
-                    && event.subject.as_ref().is_some_and(|subject| {
-                        subject.kind == EntityKind::Memory && subject.id == replacement.id.uuid()
-                    })
-            })
-            .expect("replacement Memory source event");
-        let (expire_id, expire_source_id) = memory_revision_candidate(
-            &store,
-            config.user_principal_id,
-            replacement.id,
-            replacement_event.event_id,
-            replacement_event.canonical_hash()?,
-            None,
-        )
-        .await?;
-        engine
-            .verify_integration_candidate(expire_id, config.user_principal_id, "human checked")
-            .await?;
-        let hekate::runtime::MemoryIntegrationResult::Expired {
-            memory: expired,
-            materialization: expiry_materialization,
-        } = engine.integrate_memory(expire_id).await?
-        else {
-            panic!("typed expire proposal should expire the Memory")
-        };
-        assert_eq!(expired.status, ActiveMemoryStatus::Expired);
-        assert_eq!(
-            expiry_materialization.source_event_ids,
-            vec![expire_source_id]
-        );
-        assert_eq!(
-            store.state().await?.memory_revision_materializations.len(),
-            2
-        );
-        let state = store.state().await?;
-        assert!(state
-            .active_memories
-            .values()
-            .all(|memory| memory.status != ActiveMemoryStatus::Active));
-        assert!(state
-            .observations
-            .values()
-            .any(|item| item.content == "a durable memory source"));
-        let events = store.events().await?;
-        let original_source = events
-            .iter()
-            .find(|event| event.event_id == original_source_id)
-            .expect("original source event retained");
-        assert!(original_source.verify_integrity()?);
-        assert_eq!(
-            original_source.payload["content"],
-            "a durable memory source"
-        );
-        let recalled = recall_local(
-            &RecallQuery {
-                text: "new memory claim after contradictory evidence".to_owned(),
-                limit: 6,
-                exclude_event_ids: Vec::new(),
-                as_of_sequence: Some(state.revision),
-            },
-            &state,
-            &events,
-        );
-        assert!(recalled
-            .items
-            .iter()
-            .all(|item| item.entity.kind != EntityKind::Memory));
-        assert!(
-            hekate::runtime::embedding_indexer::embedding_documents(&state, &events)?
+    for scenario in [
+        "observation_source_provenance_retained",
+        "revision_candidate_waits_for_nonmodel_verification",
+        "verified_replace_expire_preserves_history",
+        "foreground_context_reflects_materialized_memory",
+    ] {
+        for iteration in 1..=10 {
+            let (store, initial_id, _, original_source_id) = fixture().await?;
+            let config = Config::default();
+            let engine = engine(store.clone(), None);
+            engine
+                .verify_integration_candidate(initial_id, config.user_principal_id, "human checked")
+                .await?;
+            let hekate::runtime::MemoryIntegrationResult::Created {
+                memory_candidate: original_candidate,
+                memory: original_memory,
+                ..
+            } = engine.integrate_memory(initial_id).await?
+            else {
+                panic!("plain Memory must retain the legacy creation path")
+            };
+            let follow_up = "What does the durable memory source say?";
+            let before_seen = Arc::new(Mutex::new(Vec::new()));
+            let before_result = context_engine(store.clone(), before_seen.clone())
+                .handle(Observation {
+                    id: ObservationId::new(),
+                    actor_id: config.user_principal_id,
+                    content: follow_up.to_owned(),
+                    source_type: "test".to_owned(),
+                    source_ref: None,
+                    thread_id: None,
+                    message_id: None,
+                    received_at: now(),
+                })
+                .await?;
+            let before_context = before_seen
+                .lock()
+                .expect("before context capture")
+                .last()
+                .cloned()
+                .expect("before context");
+            let before_memory = before_context
+                .recall
+                .items
                 .iter()
-                .all(|document| document.entity_kind != EmbeddingEntityKind::Memory)
-        );
-        assert_eq!(Projector::replay(&events)?, state);
-        eval_rows.push(serde_json::json!({
-        "scenario": "verified_memory_replace_expire_context_and_provenance",
+                .find(|item| item.entity.kind == EntityKind::Memory)
+                .expect("original Memory in model recall");
+            assert_eq!(before_memory.entity.id, original_memory.id.uuid());
+            let before_middle = before_context
+                .context_snapshot
+                .as_ref()
+                .expect("before context snapshot")["compressed_middle"]
+                .as_array()
+                .expect("middle items");
+            assert!(before_middle
+                .iter()
+                .any(|item| item["entity"]["id"] == original_memory.id.to_string()));
+            let original_events = store.events().await?;
+            let original_memory_event = original_events
+                .iter()
+                .find(|event| {
+                    event.event_kind == EventKind::MemoryPromoted
+                        && event.subject.as_ref().is_some_and(|subject| {
+                            subject.kind == EntityKind::Memory
+                                && subject.id == original_memory.id.uuid()
+                        })
+                })
+                .expect("original Memory source event")
+                .clone();
+            let (replace_id, replace_source_id) = memory_revision_candidate(
+                &store,
+                config.user_principal_id,
+                original_memory.id,
+                original_memory_event.event_id,
+                original_memory_event.canonical_hash()?,
+                Some("new memory claim after contradictory evidence"),
+            )
+            .await?;
+            let pending = store.state().await?;
+            assert_eq!(
+                pending.active_memories[&original_memory.id].status,
+                ActiveMemoryStatus::Active
+            );
+            assert_eq!(
+                pending.integration_candidates[&replace_id].disposition,
+                VerificationDisposition::NeedsValidation
+            );
+            assert!(pending.memory_revision_materializations.is_empty());
+            assert!(pending.integration_candidates[&replace_id]
+                .counterevidence_event_ids
+                .contains(&original_memory_event.event_id));
+            let pending_events = store.events().await?;
+            assert_eq!(Projector::replay(&pending_events)?, pending);
+            engine
+                .verify_integration_candidate(replace_id, config.user_principal_id, "human checked")
+                .await?;
+            let hekate::runtime::MemoryIntegrationResult::Replaced {
+                memory_candidate: replacement_candidate,
+                memory: replacement,
+                previous_memory,
+                materialization: replacement_materialization,
+            } = engine.integrate_memory(replace_id).await?
+            else {
+                panic!("typed replace proposal should replace the Memory")
+            };
+            assert_eq!(previous_memory.status, ActiveMemoryStatus::Superseded);
+            assert_eq!(replacement.supersedes, Some(original_memory.id));
+            assert_eq!(
+                replacement_candidate.supersedes,
+                Some(original_candidate.id)
+            );
+            assert_eq!(
+                replacement_materialization.source_event_ids,
+                vec![replace_source_id]
+            );
+            let after_seen = Arc::new(Mutex::new(Vec::new()));
+            let after_result = context_engine(store.clone(), after_seen.clone())
+                .handle(Observation {
+                    id: ObservationId::new(),
+                    actor_id: config.user_principal_id,
+                    content: follow_up.to_owned(),
+                    source_type: "test".to_owned(),
+                    source_ref: None,
+                    thread_id: None,
+                    message_id: None,
+                    received_at: now(),
+                })
+                .await?;
+            let after_context = after_seen
+                .lock()
+                .expect("after context capture")
+                .last()
+                .cloned()
+                .expect("after context");
+            let after_memory = after_context
+                .recall
+                .items
+                .iter()
+                .find(|item| item.entity.kind == EntityKind::Memory)
+                .expect("replacement Memory in model recall");
+            assert_eq!(after_memory.entity.id, replacement.id.uuid());
+            assert_eq!(after_memory.text, replacement.content);
+            assert_ne!(
+                before_result.decision.message,
+                after_result.decision.message
+            );
+            let after_middle = after_context
+                .context_snapshot
+                .as_ref()
+                .expect("after context snapshot")["compressed_middle"]
+                .as_array()
+                .expect("middle items");
+            assert!(after_middle
+                .iter()
+                .any(|item| item["entity"]["id"] == replacement.id.to_string()));
+            assert!(!after_middle
+                .iter()
+                .any(|item| item["entity"]["id"] == original_memory.id.to_string()));
+            let event_count_after_replace = store.events().await?.len();
+            assert!(matches!(
+                engine.integrate_memory(replace_id).await,
+                Err(EngineError::Integration(IntegrationError::AlreadyMaterialized(id))) if id == replace_id
+            ));
+            assert_eq!(store.events().await?.len(), event_count_after_replace);
+
+            let replacement_event = store
+                .events()
+                .await?
+                .into_iter()
+                .find(|event| {
+                    event.event_kind == EventKind::MemoryPromoted
+                        && event.subject.as_ref().is_some_and(|subject| {
+                            subject.kind == EntityKind::Memory
+                                && subject.id == replacement.id.uuid()
+                        })
+                })
+                .expect("replacement Memory source event");
+            let (expire_id, expire_source_id) = memory_revision_candidate(
+                &store,
+                config.user_principal_id,
+                replacement.id,
+                replacement_event.event_id,
+                replacement_event.canonical_hash()?,
+                None,
+            )
+            .await?;
+            engine
+                .verify_integration_candidate(expire_id, config.user_principal_id, "human checked")
+                .await?;
+            let hekate::runtime::MemoryIntegrationResult::Expired {
+                memory: expired,
+                materialization: expiry_materialization,
+            } = engine.integrate_memory(expire_id).await?
+            else {
+                panic!("typed expire proposal should expire the Memory")
+            };
+            assert_eq!(expired.status, ActiveMemoryStatus::Expired);
+            assert_eq!(
+                expiry_materialization.source_event_ids,
+                vec![expire_source_id]
+            );
+            assert_eq!(
+                store.state().await?.memory_revision_materializations.len(),
+                2
+            );
+            let state = store.state().await?;
+            assert!(state
+                .active_memories
+                .values()
+                .all(|memory| memory.status != ActiveMemoryStatus::Active));
+            assert!(state
+                .observations
+                .values()
+                .any(|item| item.content == "a durable memory source"));
+            let events = store.events().await?;
+            let original_source = events
+                .iter()
+                .find(|event| event.event_id == original_source_id)
+                .expect("original source event retained");
+            assert!(original_source.verify_integrity()?);
+            assert_eq!(
+                original_source.payload["content"],
+                "a durable memory source"
+            );
+            let recalled = recall_local(
+                &RecallQuery {
+                    text: "new memory claim after contradictory evidence".to_owned(),
+                    limit: 6,
+                    exclude_event_ids: Vec::new(),
+                    as_of_sequence: Some(state.revision),
+                },
+                &state,
+                &events,
+            );
+            assert!(recalled
+                .items
+                .iter()
+                .all(|item| item.entity.kind != EntityKind::Memory));
+            assert!(
+                hekate::runtime::embedding_indexer::embedding_documents(&state, &events)?
+                    .iter()
+                    .all(|document| document.entity_kind != EmbeddingEntityKind::Memory)
+            );
+            assert_eq!(Projector::replay(&events)?, state);
+            eval_rows.push(serde_json::json!({
+        "scenario": scenario,
         "iteration": iteration,
         "input": "new evidence changes the durable memory claim",
         "as_of_revision": pending.integration_candidates[&replace_id].as_of_revision,
@@ -999,107 +1053,147 @@ async fn verified_memory_revision_replaces_expires_and_replays(
         "cursor_after": state.sleep_cursor,
         "result": "passed",
         "projection_verified": Projector::replay(&events)? == state,
+        "external_capability_executed": false,
     }));
-        assert!(
-            hekate::runtime::recovery::recover(store.as_ref())
-                .await?
-                .projection_verified
-        );
-        engine.shutdown().await?;
+            assert!(
+                hekate::runtime::recovery::recover(store.as_ref())
+                    .await?
+                    .projection_verified
+            );
+            engine.shutdown().await?;
+        }
     }
-    let path = std::path::Path::new("target/hekate-evals/consolidation-v1.jsonl");
-    fs::create_dir_all(path.parent().expect("eval parent"))?;
-    let jsonl = eval_rows
-        .iter()
-        .map(serde_json::Value::to_string)
-        .collect::<Vec<_>>()
-        .join("\n");
-    fs::write(path, format!("{jsonl}\n"))?;
-    assert_eq!(eval_rows.len(), 10);
-    assert!(eval_rows
-        .iter()
-        .all(|record| record["result"] == "passed" && record["projection_verified"] == true));
+    write_eval_rows("consolidation-memory-revision.jsonl", &eval_rows)?;
+    assert_eq!(eval_rows.len(), 40);
+    for scenario in [
+        "observation_source_provenance_retained",
+        "revision_candidate_waits_for_nonmodel_verification",
+        "verified_replace_expire_preserves_history",
+        "foreground_context_reflects_materialized_memory",
+    ] {
+        assert_eq!(
+            eval_rows
+                .iter()
+                .filter(|record| record["scenario"] == scenario)
+                .count(),
+            10,
+            "{scenario} repetitions"
+        );
+    }
+    assert!(eval_rows.iter().all(|record| record["result"] == "passed"
+        && record["projection_verified"] == true
+        && record["external_capability_executed"] == false));
     Ok(())
 }
 
 #[tokio::test]
 async fn sleep_memory_revision_cannot_overwrite_explicit_user_preference(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (store, _, _, source_event_id) = fixture().await?;
-    let config = Config::default();
-    let projector = Projector::new(store.clone());
-    let preference_candidate = hekate::core::MemoryCandidate {
-        id: hekate::core::MemoryCandidateId::new(),
-        kind: MemoryKind::ExplicitPreference,
-        content: "explicit preference: keep answers concise".to_owned(),
-        subject_principal_id: Some(config.user_principal_id),
-        status: MemoryCandidateStatus::Candidate,
-        confidence: 100,
-        source_event_ids: vec![source_event_id],
-        valid_from: None,
-        valid_until: None,
-        supersedes: None,
-        created_at: now(),
-    };
-    let preference = hekate::core::ActiveMemory {
-        id: MemoryId::new(),
-        candidate_id: preference_candidate.id,
-        kind: MemoryKind::ExplicitPreference,
-        content: preference_candidate.content.clone(),
-        subject_principal_id: preference_candidate.subject_principal_id,
-        status: ActiveMemoryStatus::Active,
-        confidence: 100,
-        source_event_ids: vec![source_event_id],
-        valid_from: None,
-        valid_until: None,
-        supersedes: None,
-        last_verified_at: None,
-        created_at: now(),
-    };
-    projector
-        .record(event(
+    let mut eval_rows = Vec::new();
+    for iteration in 1..=10 {
+        let (store, _, _, source_event_id) = fixture().await?;
+        let config = Config::default();
+        let projector = Projector::new(store.clone());
+        let preference_candidate = hekate::core::MemoryCandidate {
+            id: hekate::core::MemoryCandidateId::new(),
+            kind: MemoryKind::ExplicitPreference,
+            content: "explicit preference: keep answers concise".to_owned(),
+            subject_principal_id: Some(config.user_principal_id),
+            status: MemoryCandidateStatus::Candidate,
+            confidence: 100,
+            source_event_ids: vec![source_event_id],
+            valid_from: None,
+            valid_until: None,
+            supersedes: None,
+            created_at: now(),
+        };
+        let preference = hekate::core::ActiveMemory {
+            id: MemoryId::new(),
+            candidate_id: preference_candidate.id,
+            kind: MemoryKind::ExplicitPreference,
+            content: preference_candidate.content.clone(),
+            subject_principal_id: preference_candidate.subject_principal_id,
+            status: ActiveMemoryStatus::Active,
+            confidence: 100,
+            source_event_ids: vec![source_event_id],
+            valid_from: None,
+            valid_until: None,
+            supersedes: None,
+            last_verified_at: None,
+            created_at: now(),
+        };
+        projector
+            .record(event(
+                config.user_principal_id,
+                EventKind::MemoryCandidateCreated,
+                EntityKind::MemoryCandidate,
+                preference_candidate.id.uuid(),
+                &preference_candidate,
+            ))
+            .await?;
+        let preference_event = event(
             config.user_principal_id,
-            EventKind::MemoryCandidateCreated,
-            EntityKind::MemoryCandidate,
-            preference_candidate.id.uuid(),
-            &preference_candidate,
-        ))
+            EventKind::MemoryPromoted,
+            EntityKind::Memory,
+            preference.id.uuid(),
+            &preference,
+        );
+        projector.record(preference_event.clone()).await?;
+        let (candidate_id, _) = memory_revision_candidate(
+            &store,
+            config.user_principal_id,
+            preference.id,
+            preference_event.event_id,
+            preference_event.canonical_hash()?,
+            Some("Sleep inferred a different answer style"),
+        )
         .await?;
-    let preference_event = event(
-        config.user_principal_id,
-        EventKind::MemoryPromoted,
-        EntityKind::Memory,
-        preference.id.uuid(),
-        &preference,
-    );
-    projector.record(preference_event.clone()).await?;
-    let (candidate_id, _) = memory_revision_candidate(
-        &store,
-        config.user_principal_id,
-        preference.id,
-        preference_event.event_id,
-        preference_event.canonical_hash()?,
-        Some("Sleep inferred a different answer style"),
-    )
-    .await?;
-    let engine = engine(store.clone(), None);
-    assert!(matches!(
-        engine
-            .verify_integration_candidate(candidate_id, config.user_principal_id, "human checked")
-            .await,
-        Err(EngineError::Integration(
-            IntegrationError::ExplicitPreferenceProtected
-        ))
-    ));
-    let state = store.state().await?;
-    assert_eq!(state.active_memories[&preference.id], preference);
-    assert_eq!(
-        state.integration_candidates[&candidate_id].disposition,
-        VerificationDisposition::NeedsValidation
-    );
-    assert!(!state.integration_verifications.contains_key(&candidate_id));
-    assert_eq!(Projector::replay(&store.events().await?)?, state);
-    engine.shutdown().await?;
+        let engine = engine(store.clone(), None);
+        assert!(matches!(
+            engine
+                .verify_integration_candidate(
+                    candidate_id,
+                    config.user_principal_id,
+                    "human checked"
+                )
+                .await,
+            Err(EngineError::Integration(
+                IntegrationError::ExplicitPreferenceProtected
+            ))
+        ));
+        let state = store.state().await?;
+        assert_eq!(state.active_memories[&preference.id], preference);
+        assert_eq!(
+            state.integration_candidates[&candidate_id].disposition,
+            VerificationDisposition::NeedsValidation
+        );
+        assert!(!state.integration_verifications.contains_key(&candidate_id));
+        let replay_verified = Projector::replay(&store.events().await?)? == state;
+        assert!(replay_verified);
+        eval_rows.push(serde_json::json!({
+        "scenario": "explicit_preference_is_protected",
+        "iteration": iteration,
+        "input": "Sleep proposes a contradictory inferred preference",
+        "as_of_revision": state.integration_candidates[&candidate_id].as_of_revision,
+        "source_event_ids": state.integration_candidates[&candidate_id].source_event_ids,
+        "counterevidence_event_ids": state.integration_candidates[&candidate_id].counterevidence_event_ids,
+        "active_before": [{"id": preference.id, "content": preference.content}],
+        "active_after": [{"id": state.active_memories[&preference.id].id, "content": state.active_memories[&preference.id].content}],
+        "cursor_before": state.sleep_cursor,
+        "cursor_after": state.sleep_cursor,
+        "result": "passed",
+        "projection_verified": replay_verified,
+        "external_capability_executed": false,
+    }));
+        engine.shutdown().await?;
+    }
+    write_eval_rows("consolidation-preference.jsonl", &eval_rows)?;
+    assert_eq!(eval_rows.len(), 10);
+    assert!(eval_rows.iter().all(|record| {
+        record["result"] == "passed"
+            && record["projection_verified"] == true
+            && record["external_capability_executed"] == false
+    }));
     Ok(())
 }
 
@@ -1165,66 +1259,92 @@ async fn memory_revision_rejects_target_changed_after_as_of(
 #[tokio::test]
 async fn position_integration_keeps_user_owned_position_unchanged(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (store, _, _, source_event_id) = fixture().await?;
-    let config = Config::default();
-    let user_position = hekate::core::Position {
-        id: hekate::core::PositionId::new(),
-        principal_id: config.user_principal_id,
-        subject: "user-owned position".to_owned(),
-        stance: Stance::Support,
-        version: 1,
-        status: PositionStatus::Active,
-        confidence: 100,
-        supersedes: None,
-        reasons: vec!["recorded by the user".to_owned()],
-        evidence_refs: vec![source_event_id],
-        reconsideration_conditions: vec!["new evidence".to_owned()],
-        created_at: now(),
-    };
-    Projector::new(store.clone())
-        .record(event(
+    let mut eval_rows = Vec::new();
+    for iteration in 1..=10 {
+        let (store, _, _, source_event_id) = fixture().await?;
+        let config = Config::default();
+        let user_position = hekate::core::Position {
+            id: hekate::core::PositionId::new(),
+            principal_id: config.user_principal_id,
+            subject: "user-owned position".to_owned(),
+            stance: Stance::Support,
+            version: 1,
+            status: PositionStatus::Active,
+            confidence: 100,
+            supersedes: None,
+            reasons: vec!["recorded by the user".to_owned()],
+            evidence_refs: vec![source_event_id],
+            reconsideration_conditions: vec!["new evidence".to_owned()],
+            created_at: now(),
+        };
+        Projector::new(store.clone())
+            .record(event(
+                config.user_principal_id,
+                EventKind::PositionEstablished,
+                EntityKind::Position,
+                user_position.id.uuid(),
+                &user_position,
+            ))
+            .await?;
+        let candidate_id = position_candidate(
+            &store,
             config.user_principal_id,
-            EventKind::PositionEstablished,
-            EntityKind::Position,
-            user_position.id.uuid(),
-            &user_position,
-        ))
+            source_event_id,
+            serde_json::json!({
+                "schema": "hekate.position_integration.v1",
+                "operation": {
+                    "action": "revise",
+                    "position_id": user_position.id.to_string(),
+                    "expected_version": 1,
+                    "stance": "oppose",
+                    "reasons": ["Sleep inferred a different stance"],
+                    "reconsideration_conditions": ["more evidence"]
+                }
+            })
+            .to_string(),
+        )
         .await?;
-    let candidate_id = position_candidate(
-        &store,
-        config.user_principal_id,
-        source_event_id,
-        serde_json::json!({
-            "schema": "hekate.position_integration.v1",
-            "operation": {
-                "action": "revise",
-                "position_id": user_position.id.to_string(),
-                "expected_version": 1,
-                "stance": "oppose",
-                "reasons": ["Sleep inferred a different stance"],
-                "reconsideration_conditions": ["more evidence"]
-            }
-        })
-        .to_string(),
-    )
-    .await?;
-    let engine = engine(store.clone(), None);
-    assert!(matches!(
-        engine
-            .verify_integration_candidate(candidate_id, config.user_principal_id, "human checked")
-            .await,
-        Err(EngineError::Integration(
-            IntegrationError::WrongPositionPrincipal(id)
-        )) if id == user_position.id
-    ));
-    let state = store.state().await?;
-    assert_eq!(state.positions[&user_position.id], user_position);
-    assert_eq!(
-        state.integration_candidates[&candidate_id].disposition,
-        VerificationDisposition::NeedsValidation
-    );
-    assert_eq!(Projector::replay(&store.events().await?)?, state);
-    engine.shutdown().await?;
+        let engine = engine(store.clone(), None);
+        assert!(matches!(
+            engine
+                .verify_integration_candidate(candidate_id, config.user_principal_id, "human checked")
+                .await,
+            Err(EngineError::Integration(
+                IntegrationError::WrongPositionPrincipal(id)
+            )) if id == user_position.id
+        ));
+        let state = store.state().await?;
+        assert_eq!(state.positions[&user_position.id], user_position);
+        assert_eq!(
+            state.integration_candidates[&candidate_id].disposition,
+            VerificationDisposition::NeedsValidation
+        );
+        let replay_verified = Projector::replay(&store.events().await?)? == state;
+        assert!(replay_verified);
+        eval_rows.push(serde_json::json!({
+        "scenario": "user_owned_position_is_unchanged",
+        "iteration": iteration,
+        "input": "Sleep proposes a revised stance for a user-owned Position",
+        "as_of_revision": state.integration_candidates[&candidate_id].as_of_revision,
+        "source_event_ids": state.integration_candidates[&candidate_id].source_event_ids,
+        "counterevidence_event_ids": state.integration_candidates[&candidate_id].counterevidence_event_ids,
+        "active_before": [{"id": user_position.id, "version": user_position.version, "status": user_position.status}],
+        "active_after": [{"id": state.positions[&user_position.id].id, "version": state.positions[&user_position.id].version, "status": state.positions[&user_position.id].status}],
+        "cursor_before": state.sleep_cursor,
+        "cursor_after": state.sleep_cursor,
+        "result": "passed",
+        "projection_verified": replay_verified,
+        "external_capability_executed": false,
+    }));
+        engine.shutdown().await?;
+    }
+    write_eval_rows("consolidation-position.jsonl", &eval_rows)?;
+    assert_eq!(eval_rows.len(), 10);
+    assert!(eval_rows.iter().all(|record| {
+        record["result"] == "passed"
+            && record["projection_verified"] == true
+            && record["external_capability_executed"] == false
+    }));
     Ok(())
 }
 

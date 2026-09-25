@@ -1,3 +1,4 @@
+use std::fs;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -585,51 +586,90 @@ async fn recall_and_incremental_index_failures_do_not_block_commit(
 #[tokio::test]
 async fn stalled_embedding_uses_bounded_local_recall_with_event_provenance(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let url = database_url("stalled-local-fallback");
-    let store = Arc::new(SqliteStore::open(&url).await?);
-    let old = observation("the migration plan is to retain event provenance");
-    let old_event = observation_event(&old);
-    Projector::new(store.clone())
-        .record(old_event.clone())
-        .await?;
-    let embedding_store = Arc::new(SqliteEmbeddingStore::open(&url).await?);
-    let indexer = Arc::new(EmbeddingIndexer::new(
-        Arc::new(HangingProvider { space: space() }),
-        embedding_store,
-        16,
-    ));
-    let recall = Arc::new(SemanticRecall::new(indexer));
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let started = Instant::now();
-    let result = engine(
-        store.clone(),
-        RecordingModel {
-            seen: seen.clone(),
-            cite_recall: true,
-        },
-        recall,
-    )
-    .handle(observation(
-        "please recall the migration plan and retain event provenance",
-    ))
-    .await?;
-    assert!(started.elapsed() < Duration::from_secs(2));
-    let context = seen
-        .lock()
-        .expect("model capture lock")
-        .last()
-        .cloned()
-        .expect("captured context");
-    let recalled = context
-        .recall
-        .items
+    let mut eval_rows = Vec::new();
+    for iteration in 1..=10 {
+        let url = database_url("stalled-local-fallback");
+        let store = Arc::new(SqliteStore::open(&url).await?);
+        let old = observation("the migration plan is to retain event provenance");
+        let old_event = observation_event(&old);
+        Projector::new(store.clone())
+            .record(old_event.clone())
+            .await?;
+        let embedding_store = Arc::new(SqliteEmbeddingStore::open(&url).await?);
+        let indexer = Arc::new(EmbeddingIndexer::new(
+            Arc::new(HangingProvider { space: space() }),
+            embedding_store,
+            16,
+        ));
+        let recall = Arc::new(SemanticRecall::new(indexer));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let started = Instant::now();
+        let engine = engine(
+            store.clone(),
+            RecordingModel {
+                seen: seen.clone(),
+                cite_recall: true,
+            },
+            recall,
+        );
+        let result = engine
+            .handle(observation(
+                "please recall the migration plan and retain event provenance",
+            ))
+            .await?;
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let context = seen
+            .lock()
+            .expect("model capture lock")
+            .last()
+            .cloned()
+            .expect("captured context");
+        let recalled = context
+            .recall
+            .items
+            .iter()
+            .find(|item| item.source_event_id == old_event.event_id)
+            .expect("local recall result");
+        assert_eq!(recalled.text, old.content);
+        assert_eq!(recalled.source_hash, old_event.canonical_hash()?);
+        assert!(recalled.as_of_sequence >= 1);
+        assert!(recalled.as_of_sequence <= context.event_sequence);
+        assert_eq!(result.decision.evidence_refs, vec![old_event.event_id]);
+        let state = store.state().await?;
+        let events = store.events().await?;
+        let projection_verified = Projector::replay(&events)? == state;
+        assert!(projection_verified);
+        eval_rows.push(serde_json::json!({
+            "scenario": "stalled_embedding_uses_bounded_local_recall",
+            "iteration": iteration,
+            "input": "please recall the migration plan and retain event provenance",
+            "as_of_revision": context.event_sequence,
+            "source_event_ids": [old_event.event_id],
+            "counterevidence_event_ids": [],
+            "active_before": [],
+            "active_after": [],
+            "elapsed_ms": started.elapsed().as_millis(),
+            "cursor_before": state.sleep_cursor,
+            "cursor_after": state.sleep_cursor,
+            "result": "passed",
+            "projection_verified": projection_verified,
+            "external_capability_executed": false,
+        }));
+        engine.shutdown().await?;
+    }
+    let path = std::path::Path::new("target/hekate-evals/consolidation-recall.jsonl");
+    fs::create_dir_all(path.parent().expect("eval parent"))?;
+    let jsonl = eval_rows
         .iter()
-        .find(|item| item.source_event_id == old_event.event_id)
-        .expect("local recall result");
-    assert_eq!(recalled.text, old.content);
-    assert_eq!(recalled.source_hash, old_event.canonical_hash()?);
-    assert!(recalled.as_of_sequence >= 1);
-    assert!(recalled.as_of_sequence <= context.event_sequence);
-    assert_eq!(result.decision.evidence_refs, vec![old_event.event_id]);
+        .map(serde_json::Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(path, format!("{jsonl}\n"))?;
+    assert_eq!(eval_rows.len(), 10);
+    assert!(eval_rows.iter().all(|record| {
+        record["result"] == "passed"
+            && record["projection_verified"] == true
+            && record["external_capability_executed"] == false
+    }));
     Ok(())
 }

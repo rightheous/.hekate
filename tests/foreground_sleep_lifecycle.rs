@@ -874,34 +874,63 @@ async fn lifecycle_contract_scenarios_pass() {
 
 #[tokio::test]
 async fn concurrent_foreground_lease_acquisition_has_one_winner() {
-    let url = database_url("single-lease");
-    let first = SqliteStore::open(&url).await.expect("first store");
-    let second = SqliteStore::open(&url).await.expect("second store");
-    let barrier = Arc::new(Barrier::new(3));
-    let first_task = {
-        let barrier = barrier.clone();
-        tokio::spawn(async move {
-            barrier.wait().await;
-            first
-                .acquire_foreground_lease("owner-a", Duration::from_secs(5))
-                .await
-                .expect("first acquisition")
-        })
-    };
-    let second_task = {
-        let barrier = barrier.clone();
-        tokio::spawn(async move {
-            barrier.wait().await;
-            second
-                .acquire_foreground_lease("owner-b", Duration::from_secs(5))
-                .await
-                .expect("second acquisition")
-        })
-    };
-    barrier.wait().await;
-    let first_won = first_task.await.expect("first task");
-    let second_won = second_task.await.expect("second task");
-    assert_ne!(first_won, second_won);
+    let mut records = Vec::new();
+    for iteration in 1..=10 {
+        let url = database_url("single-lease");
+        let first = SqliteStore::open(&url).await.expect("first store");
+        let second = SqliteStore::open(&url).await.expect("second store");
+        let barrier = Arc::new(Barrier::new(3));
+        let first_task = {
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                first
+                    .acquire_foreground_lease("owner-a", Duration::from_secs(5))
+                    .await
+                    .expect("first acquisition")
+            })
+        };
+        let second_task = {
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                second
+                    .acquire_foreground_lease("owner-b", Duration::from_secs(5))
+                    .await
+                    .expect("second acquisition")
+            })
+        };
+        barrier.wait().await;
+        let first_won = first_task.await.expect("first task");
+        let second_won = second_task.await.expect("second task");
+        assert_ne!(first_won, second_won);
+        let state = SqliteStore::open(&url)
+            .await
+            .expect("verify store")
+            .state()
+            .await
+            .expect("lease state");
+        records.push(serde_json::json!({
+            "scenario": "single_slot_lease_one_winner",
+            "iteration": iteration,
+            "input": "two owners acquire the foreground lease concurrently",
+            "lease_winner_count": usize::from(first_won) + usize::from(second_won),
+            "result": "passed",
+            "projection_verified": Projector::replay(&[]).expect("empty replay") == state,
+            "external_capability_executed": false,
+            "cursor_before": state.sleep_cursor,
+            "cursor_after": state.sleep_cursor,
+        }));
+    }
+    let path = std::path::Path::new("target/hekate-evals/consolidation-lease.jsonl");
+    fs::create_dir_all(path.parent().expect("lease eval parent")).expect("lease eval directory");
+    let jsonl = records
+        .iter()
+        .map(serde_json::Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(path, format!("{jsonl}\n")).expect("write lease evaluation");
+    assert_eq!(records.len(), 10);
 }
 
 #[tokio::test]
@@ -1014,6 +1043,25 @@ async fn hard_kill_foreground_process_allows_sleep_after_lease_expiry() {
         .expect("replay after sleep");
     assert!(replay.projection_verified);
     assert_eq!(replay.incomplete_attempts.len(), 1);
+    let kill_eval = serde_json::json!({
+        "scenario": "hard_kill_foreground_process_once",
+        "iteration": 1,
+        "input": "kill child foreground while the fake model is blocked",
+        "result": "passed",
+        "projection_verified": replay.projection_verified,
+        "external_capability_executed": external_calls.load(Ordering::SeqCst) != 0,
+        "lease_expired_before_sleep": true,
+        "sleep_status": status_text(&slept.status),
+        "cursor_before": slept.cursor_before,
+        "cursor_after": slept.cursor_after,
+    });
+    let kill_path = std::path::Path::new("target/hekate-evals/consolidation-hard-kill.jsonl");
+    fs::create_dir_all(kill_path.parent().expect("kill eval parent")).expect("kill eval directory");
+    fs::write(
+        kill_path,
+        format!("{}\n", serde_json::Value::to_string(&kill_eval)),
+    )
+    .expect("write hard-kill evaluation");
     let _ = fs::remove_file(ready_path);
 }
 

@@ -204,9 +204,12 @@ struct EvalRecord {
     selected_task_id: Option<String>,
     selected_run_id: Option<String>,
     decision_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    original_run_id: Option<String>,
     event_count: usize,
     events_added: usize,
     replay_verified: bool,
+    external_capability_executed: bool,
     result: &'static str,
     commit: String,
 }
@@ -245,9 +248,11 @@ async fn eval_record(
             .as_str()
             .expect("decision kind string")
             .to_owned(),
+        original_run_id: None,
         event_count: events.len(),
         events_added: events.len().saturating_sub(before_events),
         replay_verified: recovery.projection_verified,
+        external_capability_executed: false,
         result: "passed",
         commit: commit.to_owned(),
     }
@@ -515,7 +520,12 @@ async fn scenario_retry_after_failure_and_restart(iteration: usize, commit: &str
     let input = "new task: Preserve retry identity";
     let message = observation(input, "thread-retry", "retry-after-restart");
     let (failing_model, _) = model(true);
-    let failing_engine = engine(store.clone(), failing_model, Arc::new(AtomicUsize::new(0)));
+    let failure_capability_calls = Arc::new(AtomicUsize::new(0));
+    let failing_engine = engine(
+        store.clone(),
+        failing_model,
+        failure_capability_calls.clone(),
+    );
     assert!(matches!(
         failing_engine.handle(message.clone()).await,
         Err(EngineError::Cognitive(CognitiveError::Timeout { .. }))
@@ -525,15 +535,17 @@ async fn scenario_retry_after_failure_and_restart(iteration: usize, commit: &str
     assert_eq!(original_resolution.outcome, FocusOutcome::NewWork);
     let original_task_id = original_resolution.focus.task_id.expect("new task id");
     let original_run_id = original_resolution.focus.run_id.expect("new run id");
+    assert_eq!(failure_capability_calls.load(Ordering::SeqCst), 0);
     drop(failing_engine);
     drop(store);
 
     let restarted_store = Arc::new(SqliteStore::open(&url).await.expect("reopened store"));
     let (model_b, _) = model(false);
+    let competing_capability_calls = Arc::new(AtomicUsize::new(0));
     let engine_b = engine(
         restarted_store.clone(),
         model_b,
-        Arc::new(AtomicUsize::new(0)),
+        competing_capability_calls.clone(),
     );
     start_task(&engine_b, "Create competing active work", "thread-other")
         .await
@@ -544,10 +556,11 @@ async fn scenario_retry_after_failure_and_restart(iteration: usize, commit: &str
         .expect("events before retry")
         .len();
     let (retry_model, _) = model(false);
+    let retry_capability_calls = Arc::new(AtomicUsize::new(0));
     let restarted = engine(
         restarted_store.clone(),
         retry_model,
-        Arc::new(AtomicUsize::new(0)),
+        retry_capability_calls.clone(),
     );
     let redelivery = observation(input, "thread-retry", "retry-after-restart");
     assert_ne!(redelivery.id, message.id);
@@ -577,7 +590,9 @@ async fn scenario_retry_after_failure_and_restart(iteration: usize, commit: &str
     assert_eq!(state.goals.len(), 2);
     assert_eq!(state.tasks.len(), 2);
     assert_eq!(state.runs.len(), 2);
-    eval_record(
+    assert_eq!(competing_capability_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(retry_capability_calls.load(Ordering::SeqCst), 0);
+    let mut record = eval_record(
         "same_message_new_work_retry_reuses_original_run",
         iteration,
         input,
@@ -587,7 +602,14 @@ async fn scenario_retry_after_failure_and_restart(iteration: usize, commit: &str
         &result,
         commit,
     )
-    .await
+    .await;
+    record.original_run_id = Some(original_run_id.to_string());
+    assert_eq!(
+        record.selected_run_id.as_deref(),
+        record.original_run_id.as_deref()
+    );
+    assert!(!record.external_capability_executed);
+    record
 }
 
 async fn scenario_snapshot_matches_new_focus(iteration: usize, commit: &str) -> EvalRecord {
@@ -916,6 +938,22 @@ async fn continuity_scenarios_repeat_ten_times_and_write_jsonl() {
         .collect::<Vec<_>>()
         .join("\n");
     fs::write(path, format!("{jsonl}\n")).expect("write continuity evaluation");
+
+    let retry_records = records
+        .iter()
+        .filter(|record| record.scenario == "same_message_new_work_retry_reuses_original_run")
+        .map(|record| serde_json::to_value(record).expect("retry eval record"))
+        .collect::<Vec<_>>();
+    let retry_path = std::path::Path::new("target/hekate-evals/consolidation-retry.jsonl");
+    fs::create_dir_all(retry_path.parent().expect("retry eval parent"))
+        .expect("retry eval directory");
+    let retry_jsonl = retry_records
+        .iter()
+        .map(serde_json::Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(retry_path, format!("{retry_jsonl}\n")).expect("write retry evaluation");
+    assert_eq!(retry_records.len(), 10);
     assert_eq!(records.len(), 90);
     for scenario in [
         "cross_thread_continuation",
