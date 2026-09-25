@@ -363,6 +363,7 @@ async fn write_projection(
         "position_integration_materializations",
         "integration_candidate_materializations",
         "integration_candidate_verifications",
+        "initiatives",
         "completion_claims",
         "completion_criteria",
         "principals",
@@ -794,6 +795,32 @@ async fn write_projection(
         .bind(&materialization.fingerprint)
         .bind(materialization.as_of_revision as i64)
         .bind(&materialization.created_at)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|error| StorageError::Backend(error.to_string()))?;
+    }
+    for proposal in state.initiatives.values() {
+        sqlx::query(
+            "INSERT INTO initiatives
+             (initiative_id, fingerprint, kind, status, source_entity_kind, source_entity_id,
+              source_version, target_principal_id, as_of_revision, source_event_ids_json,
+              content, rationale, created_at, proposal_json)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(proposal.id.to_string())
+        .bind(&proposal.fingerprint)
+        .bind(enum_text(&proposal.kind))
+        .bind(enum_text(&proposal.status))
+        .bind(entity_kind_text(&proposal.source_entity.kind))
+        .bind(proposal.source_entity.id.to_string())
+        .bind(proposal.source_version as i64)
+        .bind(proposal.target_principal_id.to_string())
+        .bind(proposal.as_of_revision as i64)
+        .bind(json_text(&proposal.source_event_ids)?)
+        .bind(&proposal.content)
+        .bind(&proposal.rationale)
+        .bind(&proposal.created_at)
+        .bind(json_text(proposal)?)
         .execute(&mut **transaction)
         .await
         .map_err(|error| StorageError::Backend(error.to_string()))?;
