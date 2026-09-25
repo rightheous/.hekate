@@ -402,7 +402,7 @@ async fn run_normal_decision_scenario() -> EvalCase {
     let engine = engine(store.clone(), foreground, sleep, unused_calls());
 
     let result = engine
-        .handle(observation("keep the foreground run open"))
+        .handle(observation("new task: keep the foreground run open"))
         .await
         .expect("foreground response");
     assert!(matches!(result.decision.kind, DecisionKind::Agree));

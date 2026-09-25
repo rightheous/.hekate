@@ -454,10 +454,41 @@ async fn interaction_injects_recalled_provenance_and_excludes_current_observatio
         .position(|event| event.event_id == current.event_id)
         .expect("current observation sequence")
         + 1;
+    let focus = events
+        .iter()
+        .find(|event| {
+            event.event_kind == EventKind::FocusResolved
+                && event.subject.as_ref().is_some_and(|subject| {
+                    subject.kind == EntityKind::Observation
+                        && subject.id == result.observation_id.uuid()
+                })
+        })
+        .expect("persisted focus resolution");
+    let focus_sequence = events
+        .iter()
+        .position(|event| event.event_id == focus.event_id)
+        .expect("focus resolution sequence")
+        + 1;
+    let attempt = events
+        .iter()
+        .find(|event| {
+            event.event_kind == EventKind::AttemptStarted
+                && event.correlation_id.as_deref()
+                    == Some(result.observation_id.to_string().as_str())
+        })
+        .expect("attempt after focus resolution");
+    let attempt_sequence = events
+        .iter()
+        .position(|event| event.event_id == attempt.event_id)
+        .expect("attempt sequence")
+        + 1;
     assert_eq!(
         snapshot["as_of_revision"].as_u64(),
-        Some(current_sequence as u64)
+        Some(focus_sequence as u64)
     );
+    assert!(focus_sequence > current_sequence);
+    assert_eq!(attempt_sequence, focus_sequence + 1);
+    assert_eq!(context.event_sequence, attempt_sequence as u64);
     assert!(context.event_sequence >= current_sequence as u64);
     assert!(!context.relevant_events.iter().any(|event| {
         event.subject.as_ref().is_some_and(|subject| {
@@ -509,7 +540,7 @@ async fn recall_and_incremental_index_failures_do_not_block_commit(
         recall,
     )
     .handle(observation(
-        "continue even when semantic recall is unavailable",
+        "check the request even when semantic recall is unavailable",
     ))
     .await?;
 

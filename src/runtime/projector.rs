@@ -7,12 +7,13 @@ use crate::core::transition::transition_task;
 use crate::core::{
     ActiveMemory, Approval, Attempt, CognitiveTrace, Commitment, CompletionClaim,
     CompletionClaimTransition, CompletionCriterion, Conflict, ConflictStatus, CurrentState,
-    Decision, EventKind, EvidenceRef, ExperienceEvent, Goal, IdentityVersion, IntegrationCandidate,
-    IntegrationMaterialization, IntegrationVerification, MemoryCandidate, Observation, Operation,
-    Position, PositionIntegrationActionKind, PositionIntegrationEventPayload,
+    Decision, EventKind, EvidenceRef, ExperienceEvent, FocusOutcome, FocusResolution, Goal,
+    GoalStatus, IdentityVersion, IntegrationCandidate, IntegrationMaterialization,
+    IntegrationVerification, MemoryCandidate, Observation, Operation, Position,
+    PositionIntegrationActionKind, PositionIntegrationEventPayload,
     PositionIntegrationMaterialization, PositionIntegrationOperation, PositionIntegrationProposal,
-    PositionStatus, Principal, Receipt, Relationship, Run, SleepRun, SleepRunStatus, Task,
-    TaskStatus, Verification, VerificationDisposition, VerificationStatus, WorkingState,
+    PositionStatus, Principal, Receipt, Relationship, Run, RunStatus, SleepRun, SleepRunStatus,
+    Task, TaskStatus, Verification, VerificationDisposition, VerificationStatus, WorkingState,
 };
 use crate::ports::{Storage, StorageError};
 use crate::runtime::deliberation::validate_position_revision;
@@ -97,6 +98,7 @@ impl Projector {
             EventKind::ObservationRecorded | EventKind::UserMessageReceived => {
                 insert(&event.event_kind, &event.payload, &mut state.observations)?
             }
+            EventKind::FocusResolved => apply_focus_resolution(state, event)?,
             EventKind::GoalCreated => insert(&event.event_kind, &event.payload, &mut state.goals)?,
             EventKind::TaskCreated => insert(&event.event_kind, &event.payload, &mut state.tasks)?,
             EventKind::TaskCompleted => apply_task_completion(state, event)?,
@@ -335,6 +337,138 @@ impl Projector {
         state.applied_events.push(event.event_id);
         Ok(())
     }
+}
+
+fn apply_focus_resolution(
+    state: &mut CurrentState,
+    event: &ExperienceEvent,
+) -> Result<(), ProjectionError> {
+    let resolution: FocusResolution = payload(event)?;
+    let Some(observation) = state.observations.get(&resolution.observation_id) else {
+        return invalid(
+            &event.event_kind,
+            "focus resolution references an unknown observation",
+        );
+    };
+    if event.subject.as_ref().map(|subject| {
+        subject.kind == crate::core::EntityKind::Observation
+            && subject.id == resolution.observation_id.uuid()
+    }) != Some(true)
+        || event.correlation_id.as_deref() != Some(resolution.observation_id.to_string().as_str())
+        || event.actor_id != observation.actor_id
+    {
+        return invalid(
+            &event.event_kind,
+            "focus resolution event identity does not match",
+        );
+    }
+    if resolution.as_of_revision > state.revision
+        || state
+            .focus_resolutions
+            .contains_key(&resolution.observation_id)
+    {
+        return invalid(
+            &event.event_kind,
+            "focus resolution revision or identity is invalid",
+        );
+    }
+    for candidate in &resolution.candidates {
+        let Some(task) = state.tasks.get(&candidate.task_id) else {
+            return invalid(
+                &event.event_kind,
+                "focus candidate references an unknown task",
+            );
+        };
+        let Some(goal) = state.goals.get(&candidate.goal_id) else {
+            return invalid(
+                &event.event_kind,
+                "focus candidate references an unknown goal",
+            );
+        };
+        if task.goal_id != Some(candidate.goal_id)
+            || task.title != candidate.task_title
+            || task.status != candidate.task_status
+            || goal.title != candidate.goal_title
+            || (goal.owner_principal_id != observation.actor_id
+                && !goal.participants.contains(&observation.actor_id))
+            || candidate
+                .evidence_event_ids
+                .iter()
+                .any(|event_id| !state.applied_events.contains(event_id))
+        {
+            return invalid(
+                &event.event_kind,
+                "focus candidate evidence does not match state",
+            );
+        }
+        if let Some(run_id) = candidate.run_id {
+            if state
+                .runs
+                .get(&run_id)
+                .map_or(true, |run| run.task_id != Some(candidate.task_id))
+            {
+                return invalid(&event.event_kind, "focus candidate run does not match task");
+            }
+        }
+    }
+    let focus_is_valid = match resolution.outcome {
+        FocusOutcome::Continue | FocusOutcome::NewWork => {
+            let (Some(task_id), Some(run_id)) = (resolution.focus.task_id, resolution.focus.run_id)
+            else {
+                return invalid(&event.event_kind, "work focus requires a task and run");
+            };
+            let Some(task) = state.tasks.get(&task_id) else {
+                return invalid(&event.event_kind, "work focus references an unknown task");
+            };
+            let Some(run) = state.runs.get(&run_id) else {
+                return invalid(&event.event_kind, "work focus references an unknown run");
+            };
+            let owned_active_goal = task
+                .goal_id
+                .and_then(|goal_id| state.goals.get(&goal_id))
+                .is_some_and(|goal| {
+                    matches!(goal.status, GoalStatus::Active)
+                        && (goal.owner_principal_id == observation.actor_id
+                            || goal.participants.contains(&observation.actor_id))
+                });
+            let goal_matches = task.goal_id == resolution.focus.goal_id && owned_active_goal;
+            let run_matches = run.task_id == Some(task_id)
+                && matches!(run.status, RunStatus::Pending | RunStatus::Running);
+            goal_matches
+                && run_matches
+                && matches!(task.status, TaskStatus::InProgress)
+                && (resolution.outcome != FocusOutcome::NewWork
+                    || resolution.focus.goal_id.is_some())
+        }
+        FocusOutcome::Conversation => {
+            resolution.focus.goal_id.is_none()
+                && resolution.focus.task_id.is_none()
+                && resolution
+                    .focus
+                    .run_id
+                    .and_then(|run_id| state.runs.get(&run_id))
+                    .is_some_and(|run| run.task_id.is_none())
+        }
+        FocusOutcome::Clarification => {
+            resolution.focus.goal_id.is_none()
+                && resolution.focus.task_id.is_none()
+                && resolution.focus.run_id.is_none()
+                && resolution
+                    .clarification
+                    .as_ref()
+                    .is_some_and(|question| !question.trim().is_empty())
+        }
+    };
+    if !focus_is_valid {
+        return invalid(
+            &event.event_kind,
+            "focus outcome does not match its selected entities",
+        );
+    }
+    state
+        .focus_resolutions
+        .insert(resolution.observation_id, resolution);
+    Ok(())
 }
 
 fn apply_task_completion(

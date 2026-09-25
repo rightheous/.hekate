@@ -7,10 +7,12 @@ continuation language can select a task; weak or competing matches produce a
 clarification without changing Goal or Task state. Thread IDs are supporting
 evidence only.
 
-The event flow is `ObservationRecorded` → continuity resolution and any
-Goal/Task/Run changes → `AttemptStarted` → context snapshot and model call →
-Decision/Response/Attempt completion. Projection and replay remain owned by
-`Projector`; state changes use its expected-revision batch path.
+The event flow is `ObservationRecorded` → `FocusResolved` with any Goal/Task/Run
+changes in one expected-revision batch → `AttemptStarted` → context snapshot
+and model call → Decision/Response/Attempt completion. Projection and replay
+remain owned by `Projector`. `FocusResolved` is an additive ledger event; the
+projected `focus_resolutions` field has a serde default, so this adds no SQL
+schema migration.
 
 `runtime/consolidation` is only a boundary around existing Sleep and
 MemoryIntegration ownership. `runtime/initiative` defines a future proposal

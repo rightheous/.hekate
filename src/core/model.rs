@@ -4,6 +4,7 @@ use std::fmt;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use uuid::Uuid;
 
+use super::continuity::FocusResolution;
 use super::event::ExperienceEvent;
 use super::recall::RecallBundle;
 
@@ -664,6 +665,8 @@ pub struct CurrentState {
     pub conflicts: BTreeMap<ConflictId, Conflict>,
     pub commitments: BTreeMap<CommitmentId, Commitment>,
     pub observations: BTreeMap<ObservationId, Observation>,
+    #[serde(default)]
+    pub focus_resolutions: BTreeMap<ObservationId, FocusResolution>,
     pub decisions: BTreeMap<DecisionId, Decision>,
     pub action_intents: BTreeMap<ActionIntentId, ActionIntent>,
     pub operations: BTreeMap<OperationId, Operation>,
@@ -718,6 +721,7 @@ impl Default for CurrentState {
             conflicts: BTreeMap::new(),
             commitments: BTreeMap::new(),
             observations: BTreeMap::new(),
+            focus_resolutions: BTreeMap::new(),
             decisions: BTreeMap::new(),
             action_intents: BTreeMap::new(),
             operations: BTreeMap::new(),

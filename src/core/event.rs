@@ -11,6 +11,7 @@ pub enum EventKind {
     RelationshipCreated,
     UserMessageReceived,
     ObservationRecorded,
+    FocusResolved,
     GoalCreated,
     TaskCreated,
     TaskCompleted,

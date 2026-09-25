@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use super::model::{EventId, Focus, GoalId, ObservationId, RunId, TaskId, TaskStatus};
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FocusOutcome {
     Continue,
@@ -11,7 +11,7 @@ pub enum FocusOutcome {
     Clarification,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FocusBasis {
     ExplicitNewWork,

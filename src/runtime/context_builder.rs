@@ -1082,6 +1082,7 @@ fn is_recent_event(kind: &EventKind) -> bool {
         kind,
         EventKind::ObservationRecorded
             | EventKind::UserMessageReceived
+            | EventKind::FocusResolved
             | EventKind::DecisionCreated
             | EventKind::PositionEstablished
             | EventKind::PositionMaintained

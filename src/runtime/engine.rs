@@ -15,13 +15,13 @@ use crate::core::{
     ActiveMemory, ActiveMemoryStatus, Approval, ApprovalId, ApprovalStatus, Artifact, ArtifactId,
     Attempt, AttemptStatus, CognitiveTrace, CompletionClaim, CompletionClaimId,
     CompletionCriterion, CompletionCriterionId, ConflictStatus, ContextBudget, ContextBuildRequest,
-    CurrentState, DecisionKind, EvidenceRef, Focus, Goal, GoalId, GoalStatus, IdentityVersion,
-    IdentityVersionId, IntegrationCandidateId, InteractionResult, MemoryCandidate,
+    CurrentState, Decision, DecisionKind, EvidenceRef, Focus, FocusOutcome, FocusResolution,
+    IdentityVersion, IdentityVersionId, IntegrationCandidateId, InteractionResult, MemoryCandidate,
     MemoryCandidateId, MemoryCandidateStatus, MemoryId, MemoryKind, Observation, Operation,
     OperationId, OperationStatus, Position, PositionStatus, Principal, PrincipalId, PrincipalKind,
     RecallBundle, RecallQuery, Receipt, ReceiptId, Relationship, RelationshipId, ResponseRecord,
-    Run, RunId, RunStatus, Task, TaskId, TaskStatus, Verification, VerificationId,
-    VerificationStatus, WorkingState, WorkingStateId,
+    RunStatus, Task, TaskId, Verification, VerificationId, VerificationStatus, WorkingState,
+    WorkingStateId,
 };
 use crate::ports::{
     CapabilityCatalog, CapabilityError, CognitiveError, CognitiveModel, Policy, PolicyError,
@@ -31,10 +31,10 @@ use crate::runtime::completion::{
     CompletionError, CompletionGate, CompletionGateResult, CompletionStatusReport,
 };
 use crate::runtime::context_builder::{build_context_snapshot, ContextBuilderError};
+use crate::runtime::continuity::{self, FocusPlan};
 use crate::runtime::deliberation::{
     decision_from_cycle, validate_judgment, JudgmentValidationError,
 };
-use crate::runtime::focus::{focus_for_run, resolve_focus};
 use crate::runtime::memory_integration::{
     IntegrationCandidateInspection, IntegrationError, MemoryIntegration, MemoryIntegrationResult,
     PositionIntegrationResult,
@@ -268,15 +268,13 @@ impl Engine {
             .cloned()
         {
             let events = self.storage.load_events().await?;
-            let existing_run = events
-                .iter()
-                .find(|event| {
-                    event.event_kind == EventKind::RunStarted
-                        && event.correlation_id.as_deref() == Some(existing.id.to_string().as_str())
-                })
-                .map(|event| serde_json::from_value::<Run>(event.payload.clone()))
-                .transpose()?;
-            let existing_focus = existing_run.and_then(|run| focus_for_run(&state, run.id));
+            let stored_resolution = state.focus_resolutions.get(&existing.id).cloned();
+            let legacy_resolution = if stored_resolution.is_none() {
+                continuity::legacy_resolution(&state, &events, &existing)?
+            } else {
+                None
+            };
+            let existing_resolution = stored_resolution.or(legacy_resolution);
             let decision: Option<crate::core::Decision> = events
                 .iter()
                 .rev()
@@ -287,6 +285,23 @@ impl Engine {
                 .map(|event| serde_json::from_value(event.payload.clone()))
                 .transpose()?;
             if let Some(decision) = decision {
+                let state = if state.focus_resolutions.contains_key(&existing.id) {
+                    state
+                } else if let Some(resolution) = existing_resolution.clone() {
+                    self.persist_focus_plan(
+                        state,
+                        FocusPlan {
+                            resolution,
+                            goal: None,
+                            task: None,
+                            run: None,
+                        },
+                    )
+                    .await?
+                    .0
+                } else {
+                    state
+                };
                 let operation_id = decision.action.as_ref().and_then(|intent| {
                     state
                         .operations
@@ -303,7 +318,9 @@ impl Engine {
                 });
                 return Ok(InteractionResult {
                     observation_id: existing.id,
-                    focus: existing_focus.unwrap_or_else(|| resolve_focus(&state, &existing)),
+                    focus: existing_resolution
+                        .map(|resolution| resolution.focus)
+                        .unwrap_or_else(Focus::unattached),
                     decision,
                     revision: state.revision,
                     operation_id,
@@ -328,6 +345,26 @@ impl Engine {
                         "duplicate external message is missing its source event".to_owned(),
                     )
                 })?;
+            let (state, resolution) = if let Some(resolution) = existing_resolution {
+                if state.focus_resolutions.contains_key(&existing.id) {
+                    (state, resolution)
+                } else {
+                    self.persist_focus_plan(
+                        state,
+                        FocusPlan {
+                            resolution,
+                            goal: None,
+                            task: None,
+                            run: None,
+                        },
+                    )
+                    .await?
+                }
+            } else {
+                let plan =
+                    continuity::resolve(&state, &events, &existing, self.user_id, self.hekate_id);
+                self.persist_focus_plan(state, plan).await?
+            };
             return self
                 .process_observation(
                     existing,
@@ -335,7 +372,7 @@ impl Engine {
                     state,
                     started_attempt,
                     lease_lost,
-                    existing_focus,
+                    resolution,
                 )
                 .await;
         }
@@ -352,15 +389,79 @@ impl Engine {
             None,
         )?;
         let state = self.projector.record(observation_event.clone()).await?;
+        let events = self.storage.load_events().await?;
+        let plan = continuity::resolve(&state, &events, &observation, self.user_id, self.hekate_id);
+        let (state, resolution) = self.persist_focus_plan(state, plan).await?;
         self.process_observation(
             observation,
             observation_event,
             state,
             started_attempt,
             lease_lost,
-            None,
+            resolution,
         )
         .await
+    }
+
+    async fn persist_focus_plan(
+        &self,
+        state: CurrentState,
+        plan: FocusPlan,
+    ) -> Result<(CurrentState, FocusResolution), EngineError> {
+        let FocusPlan {
+            resolution,
+            goal,
+            task,
+            run,
+        } = plan;
+        let correlation_id = Some(resolution.observation_id.to_string());
+        let mut events = Vec::new();
+        if let Some(goal) = goal {
+            events.push(self.event(
+                self.user_id,
+                EventKind::GoalCreated,
+                Some(EntityRef::new(EntityKind::Goal, goal.id.uuid())),
+                &goal,
+                correlation_id.clone(),
+                None,
+            )?);
+        }
+        if let Some(task) = task {
+            events.push(self.event(
+                self.user_id,
+                EventKind::TaskCreated,
+                Some(EntityRef::new(EntityKind::Task, task.id.uuid())),
+                &task,
+                correlation_id.clone(),
+                None,
+            )?);
+        }
+        if let Some(run) = run {
+            events.push(self.event(
+                self.user_id,
+                EventKind::RunStarted,
+                Some(EntityRef::new(EntityKind::Run, run.id.uuid())),
+                &run,
+                correlation_id.clone(),
+                None,
+            )?);
+        }
+        events.push(self.event(
+            self.user_id,
+            EventKind::FocusResolved,
+            Some(EntityRef::new(
+                EntityKind::Observation,
+                resolution.observation_id.uuid(),
+            )),
+            &resolution,
+            correlation_id,
+            None,
+        )?);
+        let state = self
+            .projector
+            .record_batch(&events, Some(state.revision), None)
+            .await?;
+        Ok((state, resolution))
     }
 
     async fn process_observation(
@@ -370,8 +471,14 @@ impl Engine {
         mut state: CurrentState,
         started_attempt: &mut Option<Attempt>,
         lease_lost: &mut watch::Receiver<bool>,
-        existing_focus: Option<crate::core::Focus>,
+        resolution: FocusResolution,
     ) -> Result<InteractionResult, EngineError> {
+        if resolution.outcome == FocusOutcome::Clarification {
+            return self
+                .produce_clarification(observation, state, resolution)
+                .await;
+        }
+        let focus = resolution.focus.clone();
         let snapshot_events = self.storage.load_events().await?;
         let recall = self
             .recall_bundle(
@@ -381,7 +488,6 @@ impl Engine {
                 &snapshot_events,
             )
             .await;
-        let mut focus = existing_focus.unwrap_or_else(|| resolve_focus(&state, &observation));
         let relationship_id = state.relationships.values().find_map(|relationship| {
             (relationship.participants.contains(&self.user_id)
                 && relationship.participants.contains(&self.hekate_id))
@@ -401,10 +507,6 @@ impl Engine {
                 budget: ContextBudget::default(),
             },
         )?;
-        if focus.run_id.is_none() {
-            let (_, next_focus) = self.create_focus(&observation).await?;
-            focus = next_focus;
-        }
         let run_id = focus.run_id.ok_or_else(|| {
             EngineError::InvalidOperation("foreground focus has no run".to_owned())
         })?;
@@ -415,14 +517,17 @@ impl Engine {
             started_at: crate::core::model::now(),
             finished_at: None,
         };
+        let attempt_event = self.event(
+            self.user_id,
+            EventKind::AttemptStarted,
+            Some(EntityRef::new(EntityKind::Attempt, attempt.id.uuid())),
+            &attempt,
+            Some(observation.id.to_string()),
+            None,
+        )?;
         state = self
-            .append(
-                self.user_id,
-                EventKind::AttemptStarted,
-                Some(EntityRef::new(EntityKind::Attempt, attempt.id.uuid())),
-                &attempt,
-                Some(observation.id.to_string()),
-            )
+            .projector
+            .record_batch(&[attempt_event], Some(state.revision), None)
             .await?;
         *started_attempt = Some(attempt.clone());
 
@@ -658,7 +763,23 @@ impl Engine {
                 Some(decision_event.event_id),
             )?);
 
-            if matches!(
+            if resolution.outcome == FocusOutcome::Conversation {
+                if let Some(run) = state.runs.get(&run_id).cloned() {
+                    if matches!(run.status, RunStatus::Running) {
+                        let mut completed = run;
+                        transition_run(&mut completed, RunStatus::Completed)?;
+                        completed.completed_at = Some(crate::core::model::now());
+                        final_events.push(self.event(
+                            self.hekate_id,
+                            EventKind::RunCompleted,
+                            Some(EntityRef::new(EntityKind::Run, completed.id.uuid())),
+                            &completed,
+                            correlation_id.clone(),
+                            Some(decision_event.event_id),
+                        )?);
+                    }
+                }
+            } else if matches!(
                 decision.kind,
                 DecisionKind::Suspend | DecisionKind::Complete
             ) {
@@ -743,6 +864,119 @@ impl Engine {
             revision: state.revision,
             operation_id: planned_operation,
             approval_id: requested_approval,
+        })
+    }
+
+    async fn produce_clarification(
+        &self,
+        observation: Observation,
+        state: CurrentState,
+        resolution: FocusResolution,
+    ) -> Result<InteractionResult, EngineError> {
+        let question = resolution.clarification.clone().ok_or_else(|| {
+            EngineError::InvalidOperation(
+                "clarification resolution is missing its question".to_owned(),
+            )
+        })?;
+        let events = self.storage.load_events().await?;
+        let relationship_id = state.relationships.values().find_map(|relationship| {
+            (relationship.participants.contains(&self.user_id)
+                && relationship.participants.contains(&self.hekate_id))
+            .then_some(relationship.id)
+        });
+        let snapshot = build_context_snapshot(
+            &state,
+            &events,
+            ContextBuildRequest {
+                principal_id: self.user_id,
+                current_observation_id: Some(observation.id),
+                relationship_id,
+                task_id: None,
+                run_id: None,
+                as_of_revision: state.revision,
+                recalled: RecallBundle::empty_for(&observation.content, ""),
+                budget: ContextBudget::default(),
+            },
+        )?;
+        let mut evidence_refs = Vec::new();
+        for event in events.iter().filter(|event| {
+            (matches!(
+                event.event_kind,
+                EventKind::ObservationRecorded | EventKind::UserMessageReceived
+            ) || event.event_kind == EventKind::FocusResolved)
+                && event.correlation_id.as_deref()
+                    == Some(resolution.observation_id.to_string().as_str())
+        }) {
+            if !evidence_refs.contains(&event.event_id) {
+                evidence_refs.push(event.event_id);
+            }
+        }
+        let alternatives = resolution
+            .candidates
+            .iter()
+            .map(|candidate| format!("{} ({})", candidate.task_title, candidate.task_id))
+            .collect();
+        let mut decision = Decision::respond(question.clone());
+        decision.kind = DecisionKind::RequestClarification;
+        decision.target_principal_id = Some(self.user_id);
+        decision.request = observation.content.clone();
+        decision.context_hash = snapshot.snapshot_hash;
+        decision.confidence = 100;
+        decision.reasons = vec![format!(
+            "continuity requires confirmation: {:?}",
+            resolution.basis
+        )];
+        decision.evidence_refs = evidence_refs;
+        decision.alternatives = alternatives;
+        decision.reconsideration_conditions =
+            vec!["The user identifies a task or explicitly starts new work".to_owned()];
+        decision.unresolved_questions = vec![question.clone()];
+        let correlation_id = Some(observation.id.to_string());
+        let decision_event = self.event(
+            self.hekate_id,
+            EventKind::DecisionCreated,
+            Some(EntityRef::new(EntityKind::Decision, decision.id.uuid())),
+            &decision,
+            correlation_id.clone(),
+            None,
+        )?;
+        let response_event = self.event(
+            self.hekate_id,
+            EventKind::ResponseProduced,
+            Some(EntityRef::new(EntityKind::Decision, decision.id.uuid())),
+            &ResponseRecord {
+                decision_id: decision.id,
+                content: question,
+                created_at: crate::core::model::now(),
+            },
+            correlation_id,
+            Some(decision_event.event_id),
+        )?;
+        let indexed_events = events
+            .iter()
+            .filter(|event| {
+                event.correlation_id.as_deref()
+                    == Some(resolution.observation_id.to_string().as_str())
+            })
+            .cloned()
+            .chain([decision_event.clone(), response_event.clone()])
+            .collect::<Vec<_>>();
+        let committed = self
+            .projector
+            .record_batch(
+                &[decision_event, response_event],
+                Some(state.revision),
+                None,
+            )
+            .await?;
+        self.index_best_effort(&committed, &indexed_events).await;
+        Ok(InteractionResult {
+            observation_id: observation.id,
+            focus: resolution.focus,
+            decision,
+            revision: committed.revision,
+            operation_id: None,
+            approval_id: None,
         })
     }
 
@@ -1655,73 +1889,6 @@ impl Engine {
                 .await?;
         }
         Ok(state)
-    }
-
-    async fn create_focus(
-        &self,
-        observation: &Observation,
-    ) -> Result<(CurrentState, Focus), EngineError> {
-        let title = observation.content.chars().take(80).collect::<String>();
-        let goal = Goal {
-            id: GoalId::new(),
-            owner_principal_id: self.user_id,
-            participants: vec![self.user_id, self.hekate_id],
-            title: if title.is_empty() {
-                "Untitled goal".to_owned()
-            } else {
-                title.clone()
-            },
-            description: observation.content.clone(),
-            status: GoalStatus::Active,
-            created_at: crate::core::model::now(),
-        };
-        self.append(
-            self.user_id,
-            EventKind::GoalCreated,
-            Some(EntityRef::new(EntityKind::Goal, goal.id.uuid())),
-            &goal,
-            Some(observation.id.to_string()),
-        )
-        .await?;
-        let task = Task {
-            id: TaskId::new(),
-            goal_id: Some(goal.id),
-            title,
-            status: TaskStatus::InProgress,
-            created_at: crate::core::model::now(),
-        };
-        self.append(
-            self.user_id,
-            EventKind::TaskCreated,
-            Some(EntityRef::new(EntityKind::Task, task.id.uuid())),
-            &task,
-            Some(observation.id.to_string()),
-        )
-        .await?;
-        let run = Run {
-            id: RunId::new(),
-            task_id: Some(task.id),
-            status: RunStatus::Running,
-            started_at: crate::core::model::now(),
-            completed_at: None,
-        };
-        let state = self
-            .append(
-                self.user_id,
-                EventKind::RunStarted,
-                Some(EntityRef::new(EntityKind::Run, run.id.uuid())),
-                &run,
-                Some(observation.id.to_string()),
-            )
-            .await?;
-        Ok((
-            state,
-            Focus {
-                goal_id: Some(goal.id),
-                task_id: Some(task.id),
-                run_id: Some(run.id),
-            },
-        ))
     }
 
     async fn append<T: Serialize>(
