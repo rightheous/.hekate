@@ -64,6 +64,9 @@ pub enum EventKind {
     CompletionClaimCreated,
     CompletionClaimVerified,
     CompletionClaimRejected,
+    InitiativeProposed,
+    InitiativeReadied,
+    InitiativeDismissed,
     StateChanged,
 }
 
@@ -95,6 +98,7 @@ pub enum EntityKind {
     IntegrationCandidate,
     CompletionCriterion,
     CompletionClaim,
+    Initiative,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

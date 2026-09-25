@@ -7,10 +7,10 @@ use crate::core::transition::transition_task;
 use crate::core::{
     ActiveMemory, Approval, Attempt, CognitiveTrace, Commitment, CompletionClaim,
     CompletionClaimTransition, CompletionCriterion, Conflict, ConflictStatus, CurrentState,
-    Decision, EventKind, EvidenceRef, ExperienceEvent, FocusOutcome, FocusResolution, Goal,
-    GoalStatus, IdentityVersion, IntegrationCandidate, IntegrationMaterialization,
-    IntegrationVerification, MemoryCandidate, Observation, Operation, Position,
-    PositionIntegrationActionKind, PositionIntegrationEventPayload,
+    Decision, EntityKind, EventKind, EvidenceRef, ExperienceEvent, FocusOutcome, FocusResolution,
+    Goal, GoalStatus, IdentityVersion, InitiativeProposal, InitiativeStatus, IntegrationCandidate,
+    IntegrationMaterialization, IntegrationVerification, MemoryCandidate, Observation, Operation,
+    Position, PositionIntegrationActionKind, PositionIntegrationEventPayload,
     PositionIntegrationMaterialization, PositionIntegrationOperation, PositionIntegrationProposal,
     PositionStatus, Principal, Receipt, Relationship, Run, RunStatus, SleepRun, SleepRunStatus,
     Task, TaskStatus, Verification, VerificationDisposition, VerificationStatus, WorkingState,
@@ -202,6 +202,14 @@ impl Projector {
                     event.event_kind.clone(),
                 )?;
             }
+            EventKind::InitiativeProposed => apply_initiative_proposed(state, event)?,
+            EventKind::InitiativeReadied => apply_initiative_transition(
+                state,
+                event,
+                InitiativeStatus::Proposed,
+                InitiativeStatus::Ready,
+            )?,
+            EventKind::InitiativeDismissed => apply_initiative_dismissed(state, event)?,
             EventKind::ApprovalRequested | EventKind::ApprovalResolved => {
                 insert(&event.event_kind, &event.payload, &mut state.approvals)?
             }
@@ -497,6 +505,184 @@ fn apply_task_completion(
     }
     state.tasks.insert(completed.id, completed);
     Ok(())
+}
+
+fn apply_initiative_proposed(
+    state: &mut CurrentState,
+    event: &ExperienceEvent,
+) -> Result<(), ProjectionError> {
+    let proposal: InitiativeProposal = payload(event)?;
+    if proposal.status != InitiativeStatus::Proposed
+        || proposal.content.trim().is_empty()
+        || proposal.rationale.trim().is_empty()
+        || proposal.as_of_revision != state.revision
+        || proposal.source_event_ids.is_empty()
+        || proposal
+            .source_event_ids
+            .iter()
+            .any(|id| !state.applied_events.contains(id))
+        || !state
+            .principals
+            .get(&proposal.target_principal_id)
+            .is_some_and(|principal| matches!(principal.kind, crate::core::PrincipalKind::User))
+        || !is_model_actor(state, event.actor_id)
+        || !initiative_subject_matches(event, proposal.id)
+        || !initiative_source_exists(state, &proposal.source_entity)
+        || crate::core::initiative_fingerprint(
+            proposal.kind,
+            &proposal.source_entity,
+            proposal.source_version,
+            proposal.target_principal_id,
+            &proposal.source_event_ids,
+        ) != proposal.fingerprint
+    {
+        return invalid(&event.event_kind, "invalid initiative proposal");
+    }
+    if state.initiatives.contains_key(&proposal.id)
+        || state
+            .initiatives
+            .values()
+            .any(|existing| existing.fingerprint == proposal.fingerprint)
+    {
+        return invalid(&event.event_kind, "duplicate initiative ID or fingerprint");
+    }
+    state.initiatives.insert(proposal.id, proposal);
+    Ok(())
+}
+
+fn apply_initiative_transition(
+    state: &mut CurrentState,
+    event: &ExperienceEvent,
+    from: InitiativeStatus,
+    to: InitiativeStatus,
+) -> Result<(), ProjectionError> {
+    let proposal: InitiativeProposal = payload(event)?;
+    if proposal.status != InitiativeStatus::Ready || !is_model_actor(state, event.actor_id) {
+        return invalid(&event.event_kind, "invalid initiative readiness transition");
+    }
+    apply_initiative_status(state, event, proposal, from, to)
+}
+
+fn apply_initiative_dismissed(
+    state: &mut CurrentState,
+    event: &ExperienceEvent,
+) -> Result<(), ProjectionError> {
+    let proposal: InitiativeProposal = payload(event)?;
+    if proposal.status != InitiativeStatus::Dismissed
+        || event.actor_id != proposal.target_principal_id
+    {
+        return invalid(
+            &event.event_kind,
+            "only the target principal can dismiss an initiative",
+        );
+    }
+    let current =
+        state
+            .initiatives
+            .get(&proposal.id)
+            .ok_or_else(|| ProjectionError::InvalidPayload {
+                event_kind: format!("{:?}", event.event_kind),
+                message: "dismissal references an unknown initiative".to_owned(),
+            })?;
+    if current.status != InitiativeStatus::Proposed && current.status != InitiativeStatus::Ready {
+        return invalid(
+            &event.event_kind,
+            "initiative is already dismissed or terminal",
+        );
+    }
+    let from = current.status.clone();
+    apply_initiative_status(state, event, proposal, from, InitiativeStatus::Dismissed)
+}
+
+fn apply_initiative_status(
+    state: &mut CurrentState,
+    event: &ExperienceEvent,
+    proposal: InitiativeProposal,
+    from: InitiativeStatus,
+    to: InitiativeStatus,
+) -> Result<(), ProjectionError> {
+    let Some(current) = state.initiatives.get(&proposal.id) else {
+        return invalid(
+            &event.event_kind,
+            "initiative transition references an unknown proposal",
+        );
+    };
+    let mut expected = current.clone();
+    if expected.status != from {
+        return invalid(&event.event_kind, "invalid initiative lifecycle transition");
+    }
+    expected.status = to;
+    if expected != proposal || !initiative_subject_matches(event, proposal.id) {
+        return invalid(
+            &event.event_kind,
+            "initiative transition changed proposal data",
+        );
+    }
+    state.initiatives.insert(proposal.id, proposal);
+    Ok(())
+}
+
+fn initiative_subject_matches(event: &ExperienceEvent, id: uuid::Uuid) -> bool {
+    event
+        .subject
+        .as_ref()
+        .is_some_and(|subject| subject.kind == EntityKind::Initiative && subject.id == id)
+        && event.source.source_type == "initiative"
+        && event.source.source_ref.as_deref() == Some(id.to_string().as_str())
+        && event.correlation_id.as_deref() == Some(id.to_string().as_str())
+}
+
+fn initiative_source_exists(state: &CurrentState, source: &crate::core::EntityRef) -> bool {
+    use EntityKind::*;
+    match source.kind {
+        Principal => state.principals.keys().any(|id| id.uuid() == source.id),
+        IdentityVersion => state
+            .identity_versions
+            .keys()
+            .any(|id| id.uuid() == source.id),
+        Relationship => state.relationships.keys().any(|id| id.uuid() == source.id),
+        Observation => state.observations.keys().any(|id| id.uuid() == source.id),
+        Goal => state.goals.keys().any(|id| id.uuid() == source.id),
+        Task => state.tasks.keys().any(|id| id.uuid() == source.id),
+        Run => state.runs.keys().any(|id| id.uuid() == source.id),
+        WorkingState => state
+            .working_states
+            .values()
+            .any(|item| item.id.uuid() == source.id),
+        Decision => state.decisions.keys().any(|id| id.uuid() == source.id),
+        Position => state.positions.keys().any(|id| id.uuid() == source.id),
+        Conflict => state.conflicts.keys().any(|id| id.uuid() == source.id),
+        Commitment => state.commitments.keys().any(|id| id.uuid() == source.id),
+        ActionIntent => state.action_intents.keys().any(|id| id.uuid() == source.id),
+        Operation => state.operations.keys().any(|id| id.uuid() == source.id),
+        Approval => state.approvals.keys().any(|id| id.uuid() == source.id),
+        Receipt => state.receipts.keys().any(|id| id.uuid() == source.id),
+        Verification => state.verifications.keys().any(|id| id.uuid() == source.id),
+        MemoryCandidate => state
+            .memory_candidates
+            .keys()
+            .any(|id| id.uuid() == source.id),
+        Memory => state
+            .active_memories
+            .keys()
+            .any(|id| id.uuid() == source.id),
+        Attempt => state.attempts.keys().any(|id| id.uuid() == source.id),
+        Artifact => state.artifacts.keys().any(|id| id.uuid() == source.id),
+        SleepRun => state.sleep_runs.keys().any(|id| id.uuid() == source.id),
+        IntegrationCandidate => state
+            .integration_candidates
+            .keys()
+            .any(|id| id.uuid() == source.id),
+        CompletionCriterion => state
+            .completion_criteria
+            .keys()
+            .any(|id| id.uuid() == source.id),
+        CompletionClaim => state
+            .completion_claims
+            .keys()
+            .any(|id| id.uuid() == source.id),
+        Initiative => false,
+    }
 }
 
 fn apply_position_event(

@@ -16,6 +16,9 @@ use crate::core::{
 use crate::ports::EmbeddingStore;
 use crate::runtime::embedding_indexer::{embedding_documents, EmbeddingIndexer};
 use crate::runtime::engine::Engine;
+use crate::runtime::initiative::service::InitiativeService;
+use crate::runtime::initiative::worker::{InitiativeWorker, InitiativeWorkerConfig};
+use crate::runtime::recovery::recover;
 use crate::runtime::sleep_worker::{SleepWorker, SleepWorkerConfig};
 
 mod repl;
@@ -90,6 +93,12 @@ pub struct Cli {
     #[arg(long)]
     pub sleep_worker: bool,
     #[arg(long)]
+    pub initiative_once: bool,
+    #[arg(long)]
+    pub initiatives: bool,
+    #[arg(long, value_name = "INITIATIVE_ID")]
+    pub dismiss_initiative: Option<String>,
+    #[arg(long)]
     pub memory_candidate: Option<String>,
     #[arg(long)]
     pub memory_kind: Option<String>,
@@ -118,6 +127,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         validate_chat_args(&cli)?;
     }
     validate_sleep_args(&cli)?;
+    validate_initiative_args(&cli)?;
     validate_integration_args(&cli)?;
     if cli.sleep_worker {
         validate_sleep_worker_args(&cli)?;
@@ -142,6 +152,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     if cli.embedding_status || cli.embedding_index_once || cli.embedding_search.is_some() {
         return run_embedding_command(&config, &cli).await;
     }
+    if cli.initiative_once || cli.initiatives || cli.dismiss_initiative.is_some() {
+        return run_initiative_command(&config, &cli).await;
+    }
     let engine = build_engine(&config).await?;
     if cli.sleep_worker {
         let worker_config = SleepWorkerConfig::from_config(&config)?;
@@ -152,13 +165,30 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         return Ok(());
     }
     if cli.chat {
+        let initiative_store = Arc::new(SqliteStore::open(&config.database_url).await?);
+        let initiative_service = InitiativeService::new(
+            initiative_store,
+            config.hekate_principal_id,
+            config.user_principal_id,
+        );
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let worker = InitiativeWorker::new(
+            initiative_service.clone(),
+            InitiativeWorkerConfig::default(),
+        )?;
+        let worker_task = tokio::spawn(async move {
+            worker.run_until_shutdown(shutdown_rx).await;
+        });
         let thread_id = cli
             .thread_id
             .clone()
             .unwrap_or_else(|| format!("cli-{}", Uuid::new_v4()));
-        let result = repl::run(&engine, thread_id).await;
+        let result = repl::run(&engine, thread_id, initiative_service).await;
+        let _ = shutdown_tx.send(true);
+        let worker_result = worker_task.await;
         let shutdown = engine.shutdown().await;
         result?;
+        worker_result?;
         shutdown?;
         return Ok(());
     }
@@ -178,6 +208,67 @@ fn validate_sleep_args(cli: &Cli) -> anyhow::Result<()> {
     }
     if cli.sleep_once && cli.sleep_status {
         anyhow::bail!("--sleep-once cannot be combined with --sleep-status");
+    }
+    Ok(())
+}
+
+fn validate_initiative_args(cli: &Cli) -> anyhow::Result<()> {
+    let selected = [
+        cli.initiative_once,
+        cli.initiatives,
+        cli.dismiss_initiative.is_some(),
+    ]
+    .into_iter()
+    .filter(|selected| *selected)
+    .count();
+    if selected == 0 {
+        return Ok(());
+    }
+    if selected > 1 {
+        anyhow::bail!("initiative commands cannot be combined");
+    }
+    let other_command = cli.chat
+        || cli.thread_id.is_some()
+        || cli.message_id.is_some()
+        || !cli.message.is_empty()
+        || cli.inspect
+        || cli.identity
+        || cli.positions
+        || cli.conflicts
+        || cli.goals
+        || cli.tasks
+        || cli.completion_status.is_some()
+        || cli.complete_task.is_some()
+        || cli.completion_claims
+        || cli.runs
+        || cli.pending
+        || cli.resume
+        || cli.memory_list
+        || cli.response_profile
+        || cli.embedding_status
+        || cli.embedding_index_once
+        || cli.embedding_search.is_some()
+        || cli.sleep_once
+        || cli.sleep_status
+        || cli.sleep_worker
+        || cli.integration_candidates
+        || cli.verify_integration.is_some()
+        || cli.reject_integration.is_some()
+        || cli.integrate_memory.is_some()
+        || cli.integrate_position.is_some()
+        || cli.integration_reason.is_some()
+        || cli.memory_candidate.is_some()
+        || cli.memory_kind.is_some()
+        || cli.memory_confidence.is_some()
+        || cli.promote_memory.is_some()
+        || cli.reject_memory.is_some()
+        || cli.supersede_memory.is_some()
+        || cli.expire_memory.is_some()
+        || cli.approve.is_some()
+        || cli.deny.is_some()
+        || cli.execute.is_some();
+    if other_command {
+        anyhow::bail!("initiative commands cannot be combined with another command or MESSAGE");
     }
     Ok(())
 }
@@ -634,6 +725,28 @@ async fn run_embedding_command(config: &Config, cli: &Cli) -> anyhow::Result<()>
         return Ok(());
     }
     unreachable!("embedding command was selected")
+}
+
+async fn run_initiative_command(config: &Config, cli: &Cli) -> anyhow::Result<()> {
+    let store = Arc::new(SqliteStore::open(&config.database_url).await?);
+    let _ = recover(store.as_ref()).await?;
+    let service =
+        InitiativeService::new(store, config.hekate_principal_id, config.user_principal_id);
+    if cli.initiative_once {
+        let result = service.run_once().await?;
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else if cli.initiatives {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "initiatives": service.list().await?
+            }))?
+        );
+    } else if let Some(id) = &cli.dismiss_initiative {
+        let result = service.dismiss(Uuid::parse_str(id)?).await?;
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    }
+    Ok(())
 }
 
 async fn run_command(engine: &Engine, cli: &Cli) -> anyhow::Result<()> {

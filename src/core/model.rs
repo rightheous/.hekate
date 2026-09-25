@@ -705,6 +705,8 @@ pub struct CurrentState {
         BTreeMap<CompletionCriterionId, crate::core::evidence::CompletionCriterion>,
     #[serde(default)]
     pub completion_claims: BTreeMap<CompletionClaimId, crate::core::evidence::CompletionClaim>,
+    #[serde(default)]
+    pub initiatives: BTreeMap<uuid::Uuid, crate::core::initiative::InitiativeProposal>,
     pub applied_events: Vec<EventId>,
 }
 
@@ -743,6 +745,7 @@ impl Default for CurrentState {
             sleep_cursor: 0,
             completion_criteria: BTreeMap::new(),
             completion_claims: BTreeMap::new(),
+            initiatives: BTreeMap::new(),
             applied_events: Vec::new(),
         }
     }

@@ -5,20 +5,29 @@ use uuid::Uuid;
 
 use crate::core::{InteractionResult, Observation};
 use crate::runtime::engine::Engine;
+use crate::runtime::initiative::service::InitiativeService;
 
-pub async fn run(engine: &Engine, thread_id: String) -> anyhow::Result<()> {
+pub async fn run(
+    engine: &Engine,
+    thread_id: String,
+    initiatives: InitiativeService,
+) -> anyhow::Result<()> {
     let mut repl = Repl {
         engine,
+        initiatives,
         thread_id,
         json: false,
+        shown_initiative: None,
     };
     repl.run().await
 }
 
 struct Repl<'a> {
     engine: &'a Engine,
+    initiatives: InitiativeService,
     thread_id: String,
     json: bool,
+    shown_initiative: Option<uuid::Uuid>,
 }
 
 impl Repl<'_> {
@@ -26,6 +35,7 @@ impl Repl<'_> {
         println!("HEKATE ready");
         println!("Type :help for commands.");
         println!();
+        self.show_one_initiative().await?;
 
         let stdin = tokio::io::stdin();
         let mut lines = BufReader::new(stdin).lines();
@@ -126,7 +136,7 @@ impl Repl<'_> {
         }))
     }
 
-    async fn message(&self, content: &str) -> anyhow::Result<()> {
+    async fn message(&mut self, content: &str) -> anyhow::Result<()> {
         let message_id = Uuid::new_v4().to_string();
         let result = self
             .engine
@@ -142,9 +152,33 @@ impl Repl<'_> {
             })
             .await?;
         if self.json {
-            print_json(&result)
+            print_json(&result)?;
         } else {
             println!("hekate> {}", response_message(&result));
+        }
+        self.show_one_initiative().await
+    }
+
+    async fn show_one_initiative(&mut self) -> anyhow::Result<()> {
+        let Some(proposal) = self.initiatives.ready_for_display().await? else {
+            return Ok(());
+        };
+        if self.shown_initiative == Some(proposal.id) {
+            return Ok(());
+        }
+        self.shown_initiative = Some(proposal.id);
+        if self.json {
+            print_json(&serde_json::json!({
+                "type": "initiative_proposal",
+                "action_authorized": false,
+                "delivery_authorized": false,
+                "proposal": proposal,
+            }))
+        } else {
+            println!("HEKATE proposal (local review only; no action or delivery authorized):");
+            println!("  {}", proposal.content);
+            println!("  Why: {}", proposal.rationale);
+            println!("  ID: {}", proposal.id);
             Ok(())
         }
     }
