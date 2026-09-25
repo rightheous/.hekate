@@ -31,7 +31,9 @@ pub use evidence::{
     valid_sha256_hex, CompletionClaim, CompletionClaimTransition, CompletionCriterion, EvidenceRef,
     VerificationDisposition,
 };
-pub use initiative::{InitiativeProposal, InitiativeStatus};
+pub use initiative::{
+    initiative_fingerprint, AgendaCandidate, InitiativeKind, InitiativeProposal, InitiativeStatus,
+};
 pub use integration::{
     memory_revision_blocked, position_integration_blocked, IntegrationMaterialization,
     IntegrationVerification, MemoryRevisionActionKind, MemoryRevisionMaterialization,
