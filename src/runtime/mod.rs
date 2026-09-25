@@ -1,11 +1,14 @@
 pub mod completion;
+pub mod consolidation;
 pub mod contest;
 pub mod context;
 pub mod context_builder;
+pub mod continuity;
 pub mod deliberation;
 pub mod embedding_indexer;
 pub mod engine;
 pub mod focus;
+pub mod initiative;
 pub mod memory_integration;
 pub mod projector;
 pub mod recall;

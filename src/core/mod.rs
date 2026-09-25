@@ -1,7 +1,10 @@
+pub mod consolidation;
 pub mod context_snapshot;
+pub mod continuity;
 pub mod embedding;
 pub mod event;
 pub mod evidence;
+pub mod initiative;
 pub mod integration;
 pub mod model;
 pub mod recall;
@@ -9,12 +12,14 @@ pub mod response_profile;
 pub mod sleep;
 pub mod transition;
 
+pub use consolidation::ConsolidationBoundary;
 pub use context_snapshot::ContextBudgetReport as ContextSnapshotBudgetReport;
 pub use context_snapshot::{
     ContextBudget, ContextBuildRequest, ContextItem, ContextItemKind, ContextSnapshot,
     ContextSourceRef, DEFAULT_CONTEXT_ACTIVE_BUDGET_BYTES, DEFAULT_CONTEXT_ANCHOR_BUDGET_BYTES,
     DEFAULT_CONTEXT_HARD_LIMIT_BYTES, DEFAULT_CONTEXT_MIDDLE_BUDGET_BYTES,
 };
+pub use continuity::{FocusBasis, FocusCandidate, FocusOutcome, FocusResolution};
 pub use embedding::{
     EmbeddingDocument, EmbeddingEntityKind, EmbeddingIndexReport, EmbeddingMatch, EmbeddingRecord,
     EmbeddingSpace, EmbeddingStatus, EmbeddingValidationError, EmbeddingVector,
@@ -26,6 +31,7 @@ pub use evidence::{
     valid_sha256_hex, CompletionClaim, CompletionClaimTransition, CompletionCriterion, EvidenceRef,
     VerificationDisposition,
 };
+pub use initiative::{InitiativeProposal, InitiativeStatus};
 pub use integration::{
     position_integration_blocked, IntegrationMaterialization, IntegrationVerification,
     PositionIntegrationActionKind, PositionIntegrationEventPayload,
