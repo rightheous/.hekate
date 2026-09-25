@@ -1,9 +1,9 @@
-use std::io::Write;
+use std::{collections::HashSet, io::Write};
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 use uuid::Uuid;
 
-use crate::core::{InteractionResult, Observation};
+use crate::core::{InitiativeProposal, InitiativeStatus, InteractionResult, Observation};
 use crate::runtime::engine::Engine;
 use crate::runtime::initiative::service::InitiativeService;
 
@@ -17,7 +17,7 @@ pub async fn run(
         initiatives,
         thread_id,
         json: false,
-        shown_initiative: None,
+        shown_initiatives: HashSet::new(),
     };
     repl.run().await
 }
@@ -27,7 +27,7 @@ struct Repl<'a> {
     initiatives: InitiativeService,
     thread_id: String,
     json: bool,
-    shown_initiative: Option<uuid::Uuid>,
+    shown_initiatives: HashSet<Uuid>,
 }
 
 impl Repl<'_> {
@@ -160,13 +160,10 @@ impl Repl<'_> {
     }
 
     async fn show_one_initiative(&mut self) -> anyhow::Result<()> {
-        let Some(proposal) = self.initiatives.list().await?.into_iter().find(|proposal| {
-            proposal.status == crate::core::InitiativeStatus::Ready
-                && self.shown_initiative != Some(proposal.id)
-        }) else {
+        let proposals = self.initiatives.list().await?;
+        let Some(proposal) = next_unshown_ready(&proposals, &mut self.shown_initiatives) else {
             return Ok(());
         };
-        self.shown_initiative = Some(proposal.id);
         if self.json {
             print_json(&serde_json::json!({
                 "type": "initiative_proposal",
@@ -182,6 +179,17 @@ impl Repl<'_> {
             Ok(())
         }
     }
+}
+
+fn next_unshown_ready<'a>(
+    proposals: &'a [InitiativeProposal],
+    shown: &mut HashSet<Uuid>,
+) -> Option<&'a InitiativeProposal> {
+    let proposal = proposals.iter().find(|proposal| {
+        proposal.status == InitiativeStatus::Ready && !shown.contains(&proposal.id)
+    })?;
+    shown.insert(proposal.id);
+    Some(proposal)
 }
 
 fn print_prompt() -> anyhow::Result<()> {
@@ -200,5 +208,54 @@ fn response_message(result: &InteractionResult) -> &str {
         "no response message"
     } else {
         &result.decision.message
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::{EntityKind, EntityRef, InitiativeKind, PrincipalId};
+
+    fn proposal(id: u128, status: InitiativeStatus) -> InitiativeProposal {
+        let id = Uuid::from_u128(id);
+        InitiativeProposal {
+            id,
+            kind: InitiativeKind::Question,
+            content: String::new(),
+            rationale: String::new(),
+            source_entity: EntityRef::new(EntityKind::Conflict, id),
+            source_version: 1,
+            source_event_ids: Vec::new(),
+            target_principal_id: PrincipalId::new(),
+            as_of_revision: 1,
+            fingerprint: String::new(),
+            status,
+            created_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn shows_each_ready_initiative_once_and_skips_dismissed() {
+        let proposals = vec![
+            proposal(1, InitiativeStatus::Ready),
+            proposal(2, InitiativeStatus::Ready),
+            proposal(3, InitiativeStatus::Dismissed),
+        ];
+        let mut shown = HashSet::new();
+
+        for expected in [Uuid::from_u128(1), Uuid::from_u128(2)] {
+            let next =
+                next_unshown_ready(&proposals, &mut shown).expect("unshown ready initiative");
+            assert_eq!(next.id, expected);
+        }
+        assert!(next_unshown_ready(&proposals, &mut shown).is_none());
+
+        let new_ready = proposal(4, InitiativeStatus::Ready);
+        let mut updated_proposals = proposals;
+        updated_proposals.push(new_ready);
+        let next =
+            next_unshown_ready(&updated_proposals, &mut shown).expect("new ready initiative");
+        assert_eq!(next.id, Uuid::from_u128(4));
+        assert!(next_unshown_ready(&updated_proposals, &mut shown).is_none());
     }
 }

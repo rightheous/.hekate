@@ -1,8 +1,11 @@
 # Initiative v1 contract
 
-Initiative v1 defines a typed, provenance-bound proposal contract. Agenda
-selection currently returns no candidates, and no proposal is delivered or
-authorized to invoke a capability.
+Initiative v1 defines a typed, provenance-bound proposal contract. The Agenda
+selector returns evidence-backed questions for open or negotiating conflicts,
+follow-ups for HEKATE's open commitments to the user, and candidates to
+reconsider an active HEKATE position when related observations arrive after it.
+Proposals are local review items; none is delivered or authorized to invoke a
+capability.
 
 ## Types and fields
 
@@ -45,15 +48,18 @@ not invalidate deduplication.
 
 - `src/core/initiative.rs` owns the serialized types and fingerprint function.
 - `src/core/mod.rs` exposes the core contract.
-- `src/runtime/initiative/agenda.rs` owns candidate selection. Its public
-  `select` function is an empty v1 stub.
-- `src/runtime/initiative/service.rs` and `worker.rs` mark the future lifecycle
-  and orchestration boundaries; they have no behavior in this contract.
+- `src/runtime/initiative/agenda.rs` selects and orders candidates from the
+  verified ledger and current projection.
+- `src/runtime/initiative/service.rs` validates candidate provenance and
+  target scope, then records proposals and dismissals in the event ledger.
+- `src/runtime/initiative/worker.rs` runs bounded periodic cycles, deferring
+  while a foreground lease is active and backing off after errors.
 - `src/runtime/initiative/mod.rs` connects those modules and re-exports the
   shared types.
 
 ## Non-goals
 
 This contract does not change EventKind, CurrentState, projection or replay,
-database migrations, CLI behavior, model prompts, external delivery, or
-capability execution. Those require separate implementation work.
+database migrations, model prompts, external delivery, or capability
+execution. Provenance checks and fingerprints support local deduplication;
+they do not approve or send proposals.

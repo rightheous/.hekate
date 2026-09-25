@@ -1,8 +1,11 @@
 # Initiative v1 lifecycle
 
 The Initiative service turns at most one Agenda candidate into a local proposal
-per cycle. The v1 Agenda selector is still empty, so `--initiative-once` reports
-`no_candidate` until candidate selection is connected.
+per cycle. The selector can choose an unresolved question for an open or
+negotiating conflict, a follow-up to an open HEKATE commitment to the user, or
+a reconsideration of an active HEKATE position when related newer evidence
+exists. `--initiative-once` runs this selection and processes one candidate; it
+reports `no_candidate` when the agenda has none.
 
 ## Ledger and projection
 
@@ -36,10 +39,16 @@ hekate --dismiss-initiative INITIATIVE_ID
 hekate --chat
 ```
 
-`--chat` shows one unseen ready proposal in the local terminal after startup or
-an interaction. The chat starts a bounded Initiative worker that yields while
-the foreground lease is active and backs off after errors. The worker stops
-when chat exits. There is no systemd unit or automatic startup.
+`--chat` shows at most one not-yet-shown Ready proposal after startup and after
+each user message. Each proposal is shown at most once during that REPL run;
+Dismissed proposals are not shown. The display is local review only: it does not
+approve, execute, or send the proposal, and shown IDs are not saved across
+restarts.
+
+`--chat` does not start an Initiative worker by default. Pass
+`--initiative-worker` with `--chat` to start the bounded worker; it yields while
+the foreground lease is active, backs off after errors, and stops when chat
+exits. There is no systemd unit or automatic startup.
 
 Initiative v1 does not call the cognitive model, send messages, execute
 capabilities, or resume Runs. It does not interpret a historical or user-owned
