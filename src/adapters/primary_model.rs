@@ -140,20 +140,28 @@ impl PrimaryModel {
         if !status.is_success() {
             return Err(RequestError::Http(status.as_u16(), response_hash));
         }
-        let envelope: ChatResponse = serde_json::from_str(&text)
-            .map_err(|_| RequestError::Malformed(response_hash.clone()))?;
-        let content = envelope
-            .choices
-            .first()
-            .and_then(|choice| {
-                choice
-                    .message
-                    .content
-                    .clone()
-                    .filter(|content| !content.trim().is_empty())
-                    .or_else(|| choice.message.reasoning_content.clone())
-            })
-            .ok_or(RequestError::Malformed(response_hash.clone()))?;
+        let envelope: ChatResponse = match serde_json::from_str(&text) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                return Err(RequestError::Malformed(
+                    response_hash.clone(),
+                    response_diagnostic(&text, Some(error.classify())),
+                ));
+            }
+        };
+        let Some(content) = envelope.choices.first().and_then(|choice| {
+            choice
+                .message
+                .content
+                .clone()
+                .filter(|content| !content.trim().is_empty())
+                .or_else(|| choice.message.reasoning_content.clone())
+        }) else {
+            return Err(RequestError::Malformed(
+                response_hash.clone(),
+                response_diagnostic(&text, None),
+            ));
+        };
         Ok(RawResponse {
             content,
             response_hash,
@@ -350,9 +358,10 @@ impl PrimaryModel {
                     trace,
                 }
             }
-            RequestError::Malformed(response_hash) => {
+            RequestError::Malformed(response_hash, diagnostic) => {
                 trace.error_kind = Some("malformed_response".to_owned());
                 trace.raw_response_hash.get_or_insert(response_hash);
+                trace.parse_errors.push(diagnostic);
                 SleepCognitiveError::Malformed {
                     message: "provider response envelope was malformed".to_owned(),
                     trace,
@@ -386,10 +395,11 @@ impl PrimaryModel {
                     "provider_error",
                 )
             }
-            RequestError::Malformed(response_hash) => {
+            RequestError::Malformed(response_hash, diagnostic) => {
                 if trace.raw_response_hash.is_none() {
                     trace.raw_response_hash = Some(response_hash);
                 }
+                trace.parse_errors.push(diagnostic);
                 (
                     "provider response envelope was malformed".to_owned(),
                     "malformed_response",
@@ -468,7 +478,100 @@ enum RequestError {
     Timeout,
     Provider,
     Http(u16, String),
-    Malformed(String),
+    Malformed(String, String),
+}
+
+const MAX_ENVELOPE_DIAGNOSTIC_BYTES: usize = 512;
+const MAX_DIAGNOSTIC_FIELD_NAMES: usize = 8;
+const MAX_DIAGNOSTIC_FIELD_NAME_CHARS: usize = 24;
+const MAX_DIAGNOSTIC_FINISH_REASON_CHARS: usize = 32;
+
+fn response_diagnostic(raw: &str, category: Option<serde_json::error::Category>) -> String {
+    let parsed = serde_json::from_str::<Value>(raw).ok();
+    let value = parsed.as_ref();
+    let json_error = match category {
+        Some(serde_json::error::Category::Io) => "io",
+        Some(serde_json::error::Category::Syntax) => "syntax",
+        Some(serde_json::error::Category::Data) => "data",
+        Some(serde_json::error::Category::Eof) => "eof",
+        None if parsed.is_some() => "none",
+        None => "unknown",
+    };
+    let top_level_fields = value
+        .and_then(Value::as_object)
+        .map(|fields| {
+            let mut names = fields
+                .keys()
+                .take(MAX_DIAGNOSTIC_FIELD_NAMES)
+                .map(|name| diagnostic_token(name, MAX_DIAGNOSTIC_FIELD_NAME_CHARS))
+                .collect::<Vec<_>>();
+            if fields.len() > MAX_DIAGNOSTIC_FIELD_NAMES {
+                names.push("+more".to_owned());
+            }
+            format!("[{}]", names.join(","))
+        })
+        .unwrap_or_else(|| "unavailable".to_owned());
+    let choices = value
+        .and_then(|value| value.get("choices"))
+        .and_then(Value::as_array);
+    let first_choice = choices.and_then(|choices| choices.first());
+    let message = first_choice
+        .and_then(|choice| choice.get("message"))
+        .and_then(Value::as_object);
+    let shape = |value: Option<&Value>| match value {
+        None => "missing:na".to_owned(),
+        Some(Value::Null) => "null:0".to_owned(),
+        Some(Value::Bool(_)) => "boolean:1".to_owned(),
+        Some(Value::Number(_)) => "number:1".to_owned(),
+        Some(Value::String(value)) => format!("string:{}b", value.len()),
+        Some(Value::Array(value)) => format!("array:{}", value.len()),
+        Some(Value::Object(value)) => format!("object:{}", value.len()),
+    };
+    let choices_count = choices.map_or_else(|| "unavailable".to_owned(), |v| v.len().to_string());
+    let finish_reason = match first_choice.and_then(|choice| choice.get("finish_reason")) {
+        None => "missing".to_owned(),
+        Some(Value::Null) => "null".to_owned(),
+        Some(Value::String(reason)) => diagnostic_token(reason, MAX_DIAGNOSTIC_FINISH_REASON_CHARS),
+        Some(_) => "other".to_owned(),
+    };
+    let completion_tokens = value
+        .and_then(|value| value.get("usage"))
+        .and_then(|usage| usage.get("completion_tokens"))
+        .and_then(Value::as_u64)
+        .map_or_else(|| "unavailable".to_owned(), |tokens| tokens.to_string());
+    let mut diagnostic = format!(
+        "json_error={json_error};top_level_fields={};choices_count={choices_count};first_finish_reason={finish_reason};content={};reasoning_content={};completion_tokens={completion_tokens}",
+        top_level_fields,
+        shape(message.and_then(|message| message.get("content"))),
+        shape(message.and_then(|message| message.get("reasoning_content"))),
+    );
+    if diagnostic.len() > MAX_ENVELOPE_DIAGNOSTIC_BYTES {
+        let mut end = MAX_ENVELOPE_DIAGNOSTIC_BYTES;
+        while !diagnostic.is_char_boundary(end) {
+            end -= 1;
+        }
+        diagnostic.truncate(end);
+    }
+    diagnostic
+}
+
+fn diagnostic_token(value: &str, max_chars: usize) -> String {
+    let token = value
+        .chars()
+        .take(max_chars)
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if token.is_empty() {
+        "_".to_owned()
+    } else {
+        token
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1361,7 +1464,8 @@ mod tests {
     };
     use uuid::Uuid;
 
-    fn model_server() -> (String, mpsc::Receiver<Value>) {
+    fn model_server(response_body: &str) -> (String, mpsc::Receiver<Value>) {
+        let response_body = response_body.to_owned();
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
         let address = listener.local_addr().expect("address");
         let (sender, receiver) = mpsc::channel();
@@ -1394,19 +1498,88 @@ mod tests {
             let request = serde_json::from_slice(&bytes[body_start..body_start + body_len])
                 .expect("request JSON");
             sender.send(request).expect("send captured request");
-            let response = serde_json::json!({
-                "choices": [{"message": {"content": "{}"}}]
-            })
-            .to_string();
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                response.len(),
-                response
+                response_body.len(),
+                response_body
             )
             .expect("write response");
         });
         (format!("http://{address}/v1"), receiver)
+    }
+
+    async fn prompt_response(
+        response_body: &str,
+    ) -> (PrimaryModel, Result<RawResponse, RequestError>) {
+        let (base_url, requests) = model_server(response_body);
+        let model = PrimaryModel {
+            client: reqwest::Client::new(),
+            base_url,
+            api_key: None,
+            model: "test-model".to_owned(),
+        };
+        let result = model
+            .request_prompt(
+                "private-prompt-sentinel".to_owned(),
+                "private-user-sentinel".to_owned(),
+                128,
+            )
+            .await;
+        requests.recv().expect("captured request");
+        (model, result)
+    }
+
+    fn assert_malformed_traces(
+        model: &PrimaryModel,
+        error: RequestError,
+        response_body: &str,
+        expected: &[&str],
+        forbidden: &[&str],
+    ) {
+        let (response_hash, diagnostic) = match error {
+            RequestError::Malformed(response_hash, diagnostic) => (response_hash, diagnostic),
+            _ => panic!("expected a malformed response"),
+        };
+        assert_eq!(response_hash, hash(response_body));
+        assert!(diagnostic.len() <= MAX_ENVELOPE_DIAGNOSTIC_BYTES);
+        for expected in expected {
+            assert!(
+                diagnostic.contains(expected),
+                "missing {expected}: {diagnostic}"
+            );
+        }
+        for forbidden in forbidden {
+            assert!(
+                !diagnostic.contains(forbidden),
+                "diagnostic leaked {forbidden}"
+            );
+        }
+
+        let foreground = match model.request_error(
+            RequestError::Malformed(response_hash.clone(), diagnostic.clone()),
+            empty_trace(),
+            0,
+        ) {
+            CognitiveError::Malformed { trace, .. } => trace,
+            _ => panic!("expected a foreground malformed error"),
+        };
+        let sleep = match model.sleep_request_error(
+            RequestError::Malformed(response_hash.clone(), diagnostic.clone()),
+            empty_trace(),
+            0,
+        ) {
+            SleepCognitiveError::Malformed { trace, .. } => trace,
+            _ => panic!("expected a Sleep malformed error"),
+        };
+        for trace in [foreground, sleep] {
+            assert_eq!(trace.error_kind.as_deref(), Some("malformed_response"));
+            assert_eq!(
+                trace.raw_response_hash.as_deref(),
+                Some(response_hash.as_str())
+            );
+            assert_eq!(trace.parse_errors, vec![diagnostic.clone()]);
+        }
     }
 
     fn test_context() -> ThoughtContext {
@@ -1654,6 +1827,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_envelope_normal_response_preserves_content_and_hash() {
+        let response_body = r#"{"choices":[{"message":{"content":"safe output"}}]}"#;
+        let (_model, result) = prompt_response(response_body).await;
+        let response = result.expect("valid ChatResponse envelope");
+        assert_eq!(response.content, "safe output");
+        assert_eq!(response.response_hash, hash(response_body));
+    }
+
+    #[tokio::test]
+    async fn chat_envelope_malformed_cases_record_only_bounded_diagnostics() {
+        let cases: [(&str, &[&str]); 4] = [
+            (
+                r#"{"choices":[{"message":{"content":"private-output-sentinel"}}"#,
+                &["json_error=eof", "top_level_fields=unavailable"],
+            ),
+            (
+                r#"{"id":"response-id","choices":[{"finish_reason":"stop","message":{"content":{"secret":"private-output-sentinel"},"reasoning_content":"private-reasoning-sentinel"}}],"usage":{"completion_tokens":7,"prompt_tokens":101,"total_tokens":108}}"#,
+                &[
+                    "json_error=data",
+                    "top_level_fields=[choices,id,usage]",
+                    "choices_count=1",
+                    "first_finish_reason=stop",
+                    "content=object:1",
+                    "reasoning_content=string:26b",
+                    "completion_tokens=7",
+                ],
+            ),
+            (
+                r#"{"choices":[],"usage":{"completion_tokens":3,"prompt_tokens":44}}"#,
+                &[
+                    "json_error=none",
+                    "top_level_fields=[choices,usage]",
+                    "choices_count=0",
+                    "completion_tokens=3",
+                ],
+            ),
+            (
+                r#"{"id":"response-id","choices":[{"finish_reason":"length","message":{"content":null,"reasoning_content":null}}],"usage":{"completion_tokens":5,"prompt_tokens":10}}"#,
+                &[
+                    "json_error=none",
+                    "choices_count=1",
+                    "first_finish_reason=length",
+                    "content=null:0",
+                    "reasoning_content=null:0",
+                    "completion_tokens=5",
+                ],
+            ),
+        ];
+
+        for (response_body, expected) in cases {
+            let (model, result) = prompt_response(response_body).await;
+            assert_malformed_traces(
+                &model,
+                result.expect_err("malformed ChatResponse must fail"),
+                response_body,
+                expected,
+                &[
+                    "private-prompt-sentinel",
+                    "private-user-sentinel",
+                    "private-output-sentinel",
+                    "private-reasoning-sentinel",
+                    "prompt_tokens",
+                    "total_tokens",
+                ],
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn request_uses_snapshot_and_allows_its_source_event_evidence() {
         let mut context = test_context();
         context.available_capabilities = vec!["browser".to_owned()];
@@ -1711,7 +1953,7 @@ mod tests {
         };
         context.context_snapshot = Some(serde_json::to_value(snapshot).expect("snapshot JSON"));
 
-        let (base_url, requests) = model_server();
+        let (base_url, requests) = model_server(r#"{"choices":[{"message":{"content":"{}"}}]}"#);
         let model = PrimaryModel {
             client: reqwest::Client::new(),
             base_url,
