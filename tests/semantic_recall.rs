@@ -1,4 +1,5 @@
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use hekate::adapters::local_policy::LocalPolicy;
@@ -40,6 +41,28 @@ struct TestProvider {
     space: EmbeddingSpace,
     vector: Option<EmbeddingVector>,
     fail: bool,
+}
+
+struct HangingProvider {
+    space: EmbeddingSpace,
+}
+
+#[async_trait]
+impl EmbeddingProvider for HangingProvider {
+    fn space(&self) -> &EmbeddingSpace {
+        &self.space
+    }
+
+    async fn embed_query(&self, _: &str) -> Result<EmbeddingVector, EmbeddingProviderError> {
+        std::future::pending().await
+    }
+
+    async fn embed_documents(
+        &self,
+        _: &[EmbeddingDocument],
+    ) -> Result<Vec<EmbeddingVector>, EmbeddingProviderError> {
+        std::future::pending().await
+    }
 }
 
 #[async_trait]
@@ -496,14 +519,16 @@ async fn interaction_injects_recalled_provenance_and_excludes_current_observatio
         })
     }));
     assert!(context.recent_event_ids.contains(&current.event_id));
+    let state = store.state().await?;
     let current_bundle = recall
         .recall(
             &RecallQuery {
                 text: "we decided to keep the migration small".to_owned(),
                 limit: 6,
                 exclude_event_ids: vec![current.event_id],
+                as_of_sequence: Some(state.revision),
             },
-            &store.state().await?,
+            &state,
             &store.events().await?,
         )
         .await?;
@@ -554,5 +579,57 @@ async fn recall_and_incremental_index_failures_do_not_block_commit(
         .recall
         .items
         .is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn stalled_embedding_uses_bounded_local_recall_with_event_provenance(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let url = database_url("stalled-local-fallback");
+    let store = Arc::new(SqliteStore::open(&url).await?);
+    let old = observation("the migration plan is to retain event provenance");
+    let old_event = observation_event(&old);
+    Projector::new(store.clone())
+        .record(old_event.clone())
+        .await?;
+    let embedding_store = Arc::new(SqliteEmbeddingStore::open(&url).await?);
+    let indexer = Arc::new(EmbeddingIndexer::new(
+        Arc::new(HangingProvider { space: space() }),
+        embedding_store,
+        16,
+    ));
+    let recall = Arc::new(SemanticRecall::new(indexer));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let started = Instant::now();
+    let result = engine(
+        store.clone(),
+        RecordingModel {
+            seen: seen.clone(),
+            cite_recall: true,
+        },
+        recall,
+    )
+    .handle(observation(
+        "please recall the migration plan and retain event provenance",
+    ))
+    .await?;
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let context = seen
+        .lock()
+        .expect("model capture lock")
+        .last()
+        .cloned()
+        .expect("captured context");
+    let recalled = context
+        .recall
+        .items
+        .iter()
+        .find(|item| item.source_event_id == old_event.event_id)
+        .expect("local recall result");
+    assert_eq!(recalled.text, old.content);
+    assert_eq!(recalled.source_hash, old_event.canonical_hash()?);
+    assert!(recalled.as_of_sequence >= 1);
+    assert!(recalled.as_of_sequence <= context.event_sequence);
+    assert_eq!(result.decision.evidence_refs, vec![old_event.event_id]);
     Ok(())
 }

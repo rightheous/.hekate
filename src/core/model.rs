@@ -696,6 +696,9 @@ pub struct CurrentState {
     pub position_integration_materializations:
         BTreeMap<IntegrationCandidateId, crate::core::PositionIntegrationMaterialization>,
     #[serde(default)]
+    pub memory_revision_materializations:
+        BTreeMap<IntegrationCandidateId, crate::core::MemoryRevisionMaterialization>,
+    #[serde(default)]
     pub sleep_cursor: u64,
     #[serde(default)]
     pub completion_criteria:
@@ -736,6 +739,7 @@ impl Default for CurrentState {
             integration_verifications: BTreeMap::new(),
             integration_materializations: BTreeMap::new(),
             position_integration_materializations: BTreeMap::new(),
+            memory_revision_materializations: BTreeMap::new(),
             sleep_cursor: 0,
             completion_criteria: BTreeMap::new(),
             completion_claims: BTreeMap::new(),

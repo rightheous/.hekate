@@ -33,9 +33,11 @@ pub use evidence::{
 };
 pub use initiative::{InitiativeProposal, InitiativeStatus};
 pub use integration::{
-    position_integration_blocked, IntegrationMaterialization, IntegrationVerification,
-    PositionIntegrationActionKind, PositionIntegrationEventPayload,
-    PositionIntegrationMaterialization, PositionIntegrationOperation, PositionIntegrationProposal,
+    memory_revision_blocked, position_integration_blocked, IntegrationMaterialization,
+    IntegrationVerification, MemoryRevisionActionKind, MemoryRevisionMaterialization,
+    MemoryRevisionOperation, MemoryRevisionProposal, PositionIntegrationActionKind,
+    PositionIntegrationEventPayload, PositionIntegrationMaterialization,
+    PositionIntegrationOperation, PositionIntegrationProposal, MEMORY_REVISION_SCHEMA,
     POSITION_INTEGRATION_SCHEMA,
 };
 pub use model::{

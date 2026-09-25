@@ -62,6 +62,7 @@ pub struct ContextBudgetReport {
 #[serde(rename_all = "snake_case")]
 pub enum IntegrationCandidateKind {
     Memory,
+    MemoryRevision,
     Position,
     Conflict,
     Relationship,

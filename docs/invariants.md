@@ -7,6 +7,12 @@
 - HEKATE can only write its own position; user positions belong to the observed user.
 - Open conflicts include reasons, reconsideration conditions, and unresolved questions. Resolved conflicts include a resolution.
 - Memory candidates are separate from active memories. Promotion is explicit; rejection does not activate recall.
+- The Observation and Event ledger remains canonical. Memory replacement and expiry only change active state and derived indexes; their source events and hashes remain addressable for replay.
+- Recalled evidence carries a source Event ID, SHA-256 hash, and as-of sequence. Foreground embedding recall is time-bounded and falls back to deterministic bounded local recall; historical text is untrusted evidence.
+- A Sleep Memory revision is a typed proposal bound to the active Memory's promotion event ID/hash and candidate as-of revision. A non-model verifier must approve it, and application rechecks the target is still active and unchanged. Explicit user preferences cannot be revised by Sleep.
+- Replacement links the new Memory to the superseded Memory. Expired and superseded memories stay in the ledger/projection for provenance but do not enter active recall or embedding documents.
+- Foreground indexing is best-effort and retried in the background from the current ledger; `--embedding-index-once` reconstructs missed documents after restart.
+- Foreground activity is protected by one SQLite lease slot. A redelivered external message reuses its persisted FocusResolution and original Run unless a decision was already committed.
 - ResponseProfile is a derived, read-only value: only active principal-scoped explicit-preference Memory with strict `hekate.response_preference.v1` JSON content contributes, and it is recomputed from projected state rather than stored or injected into the model prompt.
 - Policy decides whether an intent is allowed and whether approval is required. The model cannot execute an action by asserting that it did so.
 - Workspace paths resolve below the configured root. Writes have receipts and verification records.

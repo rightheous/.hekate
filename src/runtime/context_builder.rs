@@ -37,6 +37,8 @@ pub enum ContextBuilderError {
         sequence: u64,
         as_of: u64,
     },
+    #[error("recall for event {event_id} has invalid as-of revision {item_as_of}")]
+    InvalidRecallAsOf { event_id: EventId, item_as_of: u64 },
     #[error("response profile as-of revision {profile_revision} is newer than requested {request_revision}")]
     FutureResponseProfile {
         profile_revision: u64,
@@ -645,7 +647,7 @@ fn build_active_recent(
 
     let mut recalled = BTreeMap::<EventId, &RecalledItem>::new();
     for item in &request.recalled.items {
-        let (sequence, _) = index.get(&item.source_event_id).copied().ok_or(
+        let (sequence, event) = index.get(&item.source_event_id).copied().ok_or(
             ContextBuilderError::MissingSourceEvent {
                 event_id: item.source_event_id,
             },
@@ -657,10 +659,25 @@ fn build_active_recent(
                 as_of,
             });
         }
-        validate_event_hash(
-            item.source_event_id,
-            index.get(&item.source_event_id).unwrap().1,
-        )?;
+        validate_event_hash(item.source_event_id, event)?;
+        if item.as_of_sequence < sequence || item.as_of_sequence > as_of {
+            return Err(ContextBuilderError::InvalidRecallAsOf {
+                event_id: item.source_event_id,
+                item_as_of: item.as_of_sequence,
+            });
+        }
+        let expected_hash =
+            event
+                .canonical_hash()
+                .map_err(|error| ContextBuilderError::InvalidSourceEvent {
+                    event_id: item.source_event_id,
+                    message: error.to_string(),
+                })?;
+        if item.source_hash != expected_hash {
+            return Err(ContextBuilderError::SourceHashMismatch {
+                event_id: item.source_event_id,
+            });
+        }
         if current_sources.contains(&item.source_event_id) || !item.score.is_finite() {
             continue;
         }

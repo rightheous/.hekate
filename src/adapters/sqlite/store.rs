@@ -359,6 +359,7 @@ async fn write_projection(
     state: &CurrentState,
 ) -> Result<(), StorageError> {
     for table in [
+        "memory_revision_materializations",
         "position_integration_materializations",
         "integration_candidate_materializations",
         "integration_candidate_verifications",
@@ -696,11 +697,16 @@ async fn write_projection(
     for verification in state.integration_verifications.values() {
         sqlx::query(
             "INSERT INTO integration_candidate_verifications
-             (candidate_id, previous_disposition, disposition, actor_id, reason,
+             (candidate_id, verification_event_id, previous_disposition, disposition, actor_id, reason,
               evidence_refs_json, as_of_revision, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(verification.candidate_id.to_string())
+        .bind(
+            verification
+                .verification_event_id
+                .map(|id| id.to_string()),
+        )
         .bind(enum_text(&verification.previous_disposition))
         .bind(enum_text(&verification.new_disposition))
         .bind(verification.actor_id.to_string())
@@ -752,6 +758,36 @@ async fn write_projection(
                 .map(json_text)
                 .transpose()?,
         )
+        .bind(json_text(&materialization.source_event_ids)?)
+        .bind(json_text(&materialization.counterevidence_event_ids)?)
+        .bind(json_text(&materialization.evidence_refs)?)
+        .bind(&materialization.fingerprint)
+        .bind(materialization.as_of_revision as i64)
+        .bind(&materialization.created_at)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|error| StorageError::Backend(error.to_string()))?;
+    }
+    for materialization in state.memory_revision_materializations.values() {
+        sqlx::query(
+            "INSERT INTO memory_revision_materializations
+             (candidate_id, verification_event_id, target_memory_id, replacement_memory_id,
+              expected_event_id, expected_event_hash, action, source_event_ids_json,
+              counterevidence_event_ids_json, evidence_refs_json, fingerprint,
+              as_of_revision, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(materialization.candidate_id.to_string())
+        .bind(materialization.verification_event_id.to_string())
+        .bind(materialization.target_memory_id.to_string())
+        .bind(
+            materialization
+                .replacement_memory_id
+                .map(|id| id.to_string()),
+        )
+        .bind(materialization.expected_event_id.to_string())
+        .bind(&materialization.expected_event_hash)
+        .bind(enum_text(&materialization.action))
         .bind(json_text(&materialization.source_event_ids)?)
         .bind(json_text(&materialization.counterevidence_event_ids)?)
         .bind(json_text(&materialization.evidence_refs)?)

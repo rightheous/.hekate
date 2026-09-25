@@ -8,7 +8,8 @@ use crate::core::{
     EntityRef, EventId, EventKind, EventSource, EvidenceRef, ExperienceEvent, IntegrationCandidate,
     IntegrationCandidateId, IntegrationCandidateKind, IntegrationMaterialization,
     IntegrationVerification, MemoryCandidate, MemoryCandidateId, MemoryCandidateStatus, MemoryId,
-    MemoryKind, Position, PositionId, PositionIntegrationActionKind,
+    MemoryKind, MemoryRevisionActionKind, MemoryRevisionMaterialization, MemoryRevisionOperation,
+    MemoryRevisionProposal, Position, PositionId, PositionIntegrationActionKind,
     PositionIntegrationEventPayload, PositionIntegrationMaterialization,
     PositionIntegrationOperation, PositionIntegrationProposal, PositionStatus, PrincipalId,
     PrincipalKind, VerificationDisposition,
@@ -73,6 +74,18 @@ pub enum IntegrationError {
     DuplicateFingerprint(String),
     #[error("Memory materialization failed: {0}")]
     MemoryMaterializationFailure(String),
+    #[error("invalid typed Memory revision proposal: {0}")]
+    InvalidMemoryRevisionProposal(String),
+    #[error("unknown Memory {0}")]
+    UnknownMemory(MemoryId),
+    #[error("Memory {0} changed after the candidate as-of revision")]
+    MemoryChanged(MemoryId),
+    #[error("Memory {0} is no longer active")]
+    MemoryNotActive(MemoryId),
+    #[error("explicit user preferences cannot be revised by Sleep")]
+    ExplicitPreferenceProtected,
+    #[error("Memory target event or hash does not match the active Memory")]
+    MemoryTargetEvidenceMismatch,
     #[error("invalid typed Position proposal: {0}")]
     InvalidPositionProposal(String),
     #[error("unknown Position {0}")]
@@ -111,13 +124,27 @@ pub struct IntegrationCandidateInspection {
     pub verification: Option<IntegrationVerification>,
     pub materialization: Option<IntegrationMaterialization>,
     pub position_materialization: Option<PositionIntegrationMaterialization>,
+    pub memory_revision_materialization: Option<MemoryRevisionMaterialization>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct MemoryIntegrationResult {
-    pub memory_candidate: MemoryCandidate,
-    pub memory: ActiveMemory,
-    pub materialization: IntegrationMaterialization,
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum MemoryIntegrationResult {
+    Created {
+        memory_candidate: MemoryCandidate,
+        memory: ActiveMemory,
+        materialization: IntegrationMaterialization,
+    },
+    Replaced {
+        memory_candidate: MemoryCandidate,
+        memory: ActiveMemory,
+        previous_memory: ActiveMemory,
+        materialization: MemoryRevisionMaterialization,
+    },
+    Expired {
+        memory: ActiveMemory,
+        materialization: MemoryRevisionMaterialization,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -128,14 +155,10 @@ pub struct PositionIntegrationResult {
 
 pub(crate) struct MaterializationCommit {
     pub result: MemoryIntegrationResult,
-    pub state: crate::core::CurrentState,
-    pub events: Vec<ExperienceEvent>,
 }
 
 pub(crate) struct PositionMaterializationCommit {
     pub result: PositionIntegrationResult,
-    pub state: crate::core::CurrentState,
-    pub events: Vec<ExperienceEvent>,
 }
 
 #[derive(Clone)]
@@ -168,6 +191,10 @@ impl MemoryIntegration {
                     .position_integration_materializations
                     .get(&candidate.id)
                     .cloned(),
+                memory_revision_materialization: state
+                    .memory_revision_materializations
+                    .get(&candidate.id)
+                    .cloned(),
             })
             .collect())
     }
@@ -191,6 +218,10 @@ impl MemoryIntegration {
                 .cloned(),
             position_materialization: state
                 .position_integration_materializations
+                .get(&candidate_id)
+                .cloned(),
+            memory_revision_materialization: state
+                .memory_revision_materializations
                 .get(&candidate_id)
                 .cloned(),
         })
@@ -274,6 +305,11 @@ impl MemoryIntegration {
             .get(&candidate_id)
             .cloned()
             .ok_or(IntegrationError::UnknownCandidate(candidate_id))?;
+        if matches!(candidate.kind, IntegrationCandidateKind::MemoryRevision) {
+            return self
+                .materialize_memory_revision(state, candidate, actor_id)
+                .await;
+        }
         if candidate.disposition != VerificationDisposition::Verified {
             return Err(IntegrationError::CandidateNotVerified(candidate_id));
         }
@@ -422,14 +458,222 @@ impl MemoryIntegration {
                 )
             })?;
         Ok(MaterializationCommit {
-            result: MemoryIntegrationResult {
+            result: MemoryIntegrationResult::Created {
                 memory_candidate: committed_memory_candidate,
                 memory: committed_memory,
                 materialization: committed_materialization,
             },
-            state: committed,
-            events: vec![candidate_event, memory_event, materialized_event],
         })
+    }
+
+    async fn materialize_memory_revision(
+        &self,
+        state: crate::core::CurrentState,
+        candidate: IntegrationCandidate,
+        actor_id: PrincipalId,
+    ) -> Result<MaterializationCommit, IntegrationError> {
+        let candidate_id = candidate.id;
+        if candidate.disposition != VerificationDisposition::Verified {
+            return Err(IntegrationError::CandidateNotVerified(candidate_id));
+        }
+        if state
+            .memory_revision_materializations
+            .contains_key(&candidate_id)
+        {
+            return Err(IntegrationError::AlreadyMaterialized(candidate_id));
+        }
+        let verification = state
+            .integration_verifications
+            .get(&candidate_id)
+            .cloned()
+            .ok_or(IntegrationError::MissingVerification(candidate_id))?;
+        if verification.new_disposition != VerificationDisposition::Verified {
+            return Err(IntegrationError::CandidateNotVerified(candidate_id));
+        }
+        let events = self.storage.load_events().await?;
+        validate_candidate(&state, &events, &candidate, &verification.evidence_refs)?;
+        let proposal = parse_memory_revision_proposal(&candidate)?;
+        let (prior_memory, expected_event) =
+            memory_revision_plan(&state, &events, &candidate, &proposal)?;
+        let verification_event_id = integration_transition_event_id(
+            &events,
+            candidate_id,
+            EventKind::IntegrationCandidateVerified,
+        )
+        .ok_or(IntegrationError::MissingVerification(candidate_id))?;
+        let (action, replacement_candidate, replacement_memory) = match &proposal.operation {
+            MemoryRevisionOperation::Replace {
+                replacement_content,
+                ..
+            } => {
+                let memory_candidate = MemoryCandidate {
+                    id: MemoryCandidateId::new(),
+                    kind: prior_memory.kind.clone(),
+                    content: replacement_content.trim().to_owned(),
+                    subject_principal_id: prior_memory.subject_principal_id,
+                    status: MemoryCandidateStatus::Candidate,
+                    confidence: candidate.confidence,
+                    source_event_ids: candidate.source_event_ids.clone(),
+                    valid_from: Some(now()),
+                    valid_until: prior_memory.valid_until.clone(),
+                    supersedes: Some(prior_memory.candidate_id),
+                    created_at: now(),
+                };
+                let memory = ActiveMemory {
+                    id: MemoryId::new(),
+                    candidate_id: memory_candidate.id,
+                    kind: memory_candidate.kind.clone(),
+                    content: memory_candidate.content.clone(),
+                    subject_principal_id: memory_candidate.subject_principal_id,
+                    status: ActiveMemoryStatus::Active,
+                    confidence: memory_candidate.confidence,
+                    source_event_ids: memory_candidate.source_event_ids.clone(),
+                    valid_from: memory_candidate.valid_from.clone(),
+                    valid_until: memory_candidate.valid_until.clone(),
+                    supersedes: Some(prior_memory.id),
+                    last_verified_at: Some(now()),
+                    created_at: now(),
+                };
+                (
+                    MemoryRevisionActionKind::Replace,
+                    Some(memory_candidate),
+                    Some(memory),
+                )
+            }
+            MemoryRevisionOperation::Expire { .. } => {
+                (MemoryRevisionActionKind::Expire, None, None)
+            }
+        };
+        let mut previous_memory = prior_memory.clone();
+        previous_memory.status = match action {
+            MemoryRevisionActionKind::Replace => ActiveMemoryStatus::Superseded,
+            MemoryRevisionActionKind::Expire => ActiveMemoryStatus::Expired,
+        };
+        let materialization = MemoryRevisionMaterialization {
+            candidate_id,
+            verification_event_id,
+            target_memory_id: prior_memory.id,
+            replacement_memory_id: replacement_memory.as_ref().map(|memory| memory.id),
+            expected_event_id: expected_event.event_id,
+            expected_event_hash: expected_event.canonical_hash()?,
+            action,
+            source_event_ids: candidate.source_event_ids.clone(),
+            counterevidence_event_ids: candidate.counterevidence_event_ids.clone(),
+            evidence_refs: verification.evidence_refs.clone(),
+            fingerprint: candidate.fingerprint.clone(),
+            as_of_revision: candidate.as_of_revision,
+            created_at: now(),
+        };
+        let mut batch = Vec::new();
+        let mut causation_id = None;
+        if let Some(memory_candidate) = replacement_candidate.as_ref() {
+            let event = integration_event(
+                actor_id,
+                EventKind::MemoryCandidateCreated,
+                EntityKind::MemoryCandidate,
+                memory_candidate.id.uuid(),
+                memory_candidate,
+                candidate_id,
+                Some(verification_event_id),
+            )?;
+            causation_id = Some(event.event_id);
+            batch.push(event);
+        }
+        let old_event = integration_event(
+            actor_id,
+            if action == MemoryRevisionActionKind::Replace {
+                EventKind::MemorySuperseded
+            } else {
+                EventKind::MemoryExpired
+            },
+            EntityKind::Memory,
+            previous_memory.id.uuid(),
+            &previous_memory,
+            candidate_id,
+            causation_id.or(Some(verification_event_id)),
+        )?;
+        causation_id = Some(old_event.event_id);
+        batch.push(old_event);
+        if let Some(memory) = replacement_memory.as_ref() {
+            batch.push(integration_event(
+                actor_id,
+                EventKind::MemoryPromoted,
+                EntityKind::Memory,
+                memory.id.uuid(),
+                memory,
+                candidate_id,
+                causation_id,
+            )?);
+        }
+        batch.push(integration_event(
+            actor_id,
+            EventKind::MemoryRevisionMaterialized,
+            EntityKind::IntegrationCandidate,
+            candidate_id.uuid(),
+            &materialization,
+            candidate_id,
+            Some(verification_event_id),
+        )?);
+        let committed = self.commit(state.revision, &batch).await?;
+        let stored_materialization = committed
+            .memory_revision_materializations
+            .get(&candidate_id)
+            .cloned()
+            .ok_or_else(|| {
+                IntegrationError::MemoryMaterializationFailure(
+                    "committed Memory revision is missing".to_owned(),
+                )
+            })?;
+        let result = match action {
+            MemoryRevisionActionKind::Replace => MemoryIntegrationResult::Replaced {
+                memory_candidate: committed
+                    .memory_candidates
+                    .get(
+                        &replacement_candidate
+                            .as_ref()
+                            .expect("replace candidate")
+                            .id,
+                    )
+                    .cloned()
+                    .ok_or_else(|| {
+                        IntegrationError::MemoryMaterializationFailure(
+                            "replacement Memory candidate is missing".to_owned(),
+                        )
+                    })?,
+                memory: committed
+                    .active_memories
+                    .get(&replacement_memory.as_ref().expect("replace memory").id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        IntegrationError::MemoryMaterializationFailure(
+                            "replacement Memory is missing".to_owned(),
+                        )
+                    })?,
+                previous_memory: committed
+                    .active_memories
+                    .get(&prior_memory.id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        IntegrationError::MemoryMaterializationFailure(
+                            "superseded Memory is missing".to_owned(),
+                        )
+                    })?,
+                materialization: stored_materialization,
+            },
+            MemoryRevisionActionKind::Expire => MemoryIntegrationResult::Expired {
+                memory: committed
+                    .active_memories
+                    .get(&prior_memory.id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        IntegrationError::MemoryMaterializationFailure(
+                            "expired Memory is missing".to_owned(),
+                        )
+                    })?,
+                materialization: stored_materialization,
+            },
+        };
+        Ok(MaterializationCommit { result })
     }
 
     pub(crate) async fn materialize_position(
@@ -538,8 +782,6 @@ impl MemoryIntegration {
                 position: committed_position,
                 materialization: committed_materialization,
             },
-            state: committed,
-            events: vec![event],
         })
     }
 
@@ -587,8 +829,15 @@ impl MemoryIntegration {
             let proposal = parse_position_proposal(&candidate)?;
             position_plan(&state, &events, &candidate, hekate_id, &proposal)?;
         }
+        if disposition == VerificationDisposition::Verified
+            && matches!(&candidate.kind, IntegrationCandidateKind::MemoryRevision)
+        {
+            let proposal = parse_memory_revision_proposal(&candidate)?;
+            memory_revision_plan(&state, &events, &candidate, &proposal)?;
+        }
         let verification = IntegrationVerification {
             candidate_id,
+            verification_event_id: None,
             previous_disposition: candidate.disposition,
             new_disposition: disposition,
             actor_id,
@@ -846,6 +1095,7 @@ fn supported_kind(kind: &IntegrationCandidateKind) -> bool {
     matches!(
         kind,
         IntegrationCandidateKind::Memory
+            | IntegrationCandidateKind::MemoryRevision
             | IntegrationCandidateKind::Association
             | IntegrationCandidateKind::Position
             | IntegrationCandidateKind::Conflict
@@ -853,6 +1103,144 @@ fn supported_kind(kind: &IntegrationCandidateKind) -> bool {
             | IntegrationCandidateKind::Identity
             | IntegrationCandidateKind::Goal
     )
+}
+
+fn parse_memory_revision_proposal(
+    candidate: &IntegrationCandidate,
+) -> Result<MemoryRevisionProposal, IntegrationError> {
+    if !matches!(&candidate.kind, IntegrationCandidateKind::MemoryRevision) {
+        return Err(IntegrationError::UnsupportedCandidateKind(
+            candidate.kind.clone(),
+        ));
+    }
+    MemoryRevisionProposal::parse(&candidate.content)
+        .map_err(IntegrationError::InvalidMemoryRevisionProposal)
+}
+
+fn memory_revision_plan<'a>(
+    state: &crate::core::CurrentState,
+    events: &'a [ExperienceEvent],
+    candidate: &IntegrationCandidate,
+    proposal: &MemoryRevisionProposal,
+) -> Result<(ActiveMemory, &'a ExperienceEvent), IntegrationError> {
+    let ledger_revision = u64::try_from(events.len()).map_err(|_| {
+        IntegrationError::InvalidMemoryRevisionProposal("ledger revision overflow".to_owned())
+    })?;
+    let as_of_len = usize::try_from(candidate.as_of_revision).map_err(|_| {
+        IntegrationError::InvalidMemoryRevisionProposal("invalid as-of revision".to_owned())
+    })?;
+    if state.revision != ledger_revision
+        || as_of_len > events.len()
+        || state
+            .sleep_runs
+            .get(&candidate.sleep_run_id)
+            .map_or(true, |run| {
+                run.high_water_revision != candidate.as_of_revision
+            })
+    {
+        return Err(IntegrationError::InvalidMemoryRevisionProposal(
+            "candidate as-of revision is not present in the event ledger".to_owned(),
+        ));
+    }
+    let (target_id, expected_event_id, expected_event_hash) = match &proposal.operation {
+        MemoryRevisionOperation::Replace {
+            target_memory_id,
+            expected_event_id,
+            expected_event_hash,
+            ..
+        }
+        | MemoryRevisionOperation::Expire {
+            target_memory_id,
+            expected_event_id,
+            expected_event_hash,
+        } => (*target_memory_id, *expected_event_id, expected_event_hash),
+    };
+    if !candidate
+        .counterevidence_event_ids
+        .contains(&expected_event_id)
+    {
+        return Err(IntegrationError::MemoryTargetEvidenceMismatch);
+    }
+    let as_of_state = Projector::replay(&events[..as_of_len])?;
+    let Some(prior) = as_of_state.active_memories.get(&target_id).cloned() else {
+        return if state.active_memories.contains_key(&target_id) {
+            Err(IntegrationError::MemoryChanged(target_id))
+        } else {
+            Err(IntegrationError::UnknownMemory(target_id))
+        };
+    };
+    if prior.status != ActiveMemoryStatus::Active {
+        return Err(IntegrationError::MemoryNotActive(target_id));
+    }
+    if prior.kind == MemoryKind::ExplicitPreference {
+        return Err(IntegrationError::ExplicitPreferenceProtected);
+    }
+    if let MemoryRevisionOperation::Replace {
+        replacement_content,
+        ..
+    } = &proposal.operation
+    {
+        if replacement_content.trim() == prior.content.trim() {
+            return Err(IntegrationError::MemoryMaterializationFailure(
+                "Memory replacement does not change its content".to_owned(),
+            ));
+        }
+    }
+    if state.active_memories.get(&target_id) != Some(&prior) {
+        return Err(IntegrationError::MemoryChanged(target_id));
+    }
+    if events.iter().skip(as_of_len).any(|event| {
+        matches!(
+            event.event_kind,
+            EventKind::MemoryPromoted | EventKind::MemorySuperseded | EventKind::MemoryExpired
+        ) && event.subject.as_ref().is_some_and(|subject| {
+            subject.kind == EntityKind::Memory && subject.id == target_id.uuid()
+        })
+    }) {
+        return Err(IntegrationError::MemoryChanged(target_id));
+    }
+    let Some((target_sequence, target_event)) = events.iter().enumerate().find(|(_, event)| {
+        event.event_id == expected_event_id
+            && event.event_kind == EventKind::MemoryPromoted
+            && event.subject.as_ref().is_some_and(|subject| {
+                subject.kind == EntityKind::Memory && subject.id == target_id.uuid()
+            })
+    }) else {
+        return Err(IntegrationError::MemoryTargetEvidenceMismatch);
+    };
+    let target_sequence = target_sequence as u64 + 1;
+    let valid = target_event
+        .verify_integrity()
+        .map_err(|_| IntegrationError::SourceEventIntegrity(expected_event_id))?;
+    let expected_hash = if target_event.integrity_hash.is_empty() {
+        target_event.canonical_hash()?
+    } else {
+        target_event.integrity_hash.clone()
+    };
+    let target_payload: ActiveMemory = serde_json::from_value(target_event.payload.clone())?;
+    if !valid
+        || target_sequence > candidate.as_of_revision
+        || target_payload != prior
+        || expected_hash != *expected_event_hash
+    {
+        return Err(IntegrationError::MemoryTargetEvidenceMismatch);
+    }
+    let has_new_source = candidate.source_event_ids.iter().any(|event_id| {
+        events.iter().enumerate().any(|(index, event)| {
+            event.event_id == *event_id
+                && index as u64 + 1 > target_sequence
+                && matches!(
+                    event.event_kind,
+                    EventKind::ObservationRecorded | EventKind::UserMessageReceived
+                )
+        })
+    });
+    if !has_new_source {
+        return Err(IntegrationError::MemoryMaterializationFailure(
+            "Memory revision needs new observation evidence".to_owned(),
+        ));
+    }
+    Ok((prior, target_event))
 }
 
 fn parse_position_proposal(

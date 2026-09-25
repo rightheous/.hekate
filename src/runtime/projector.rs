@@ -331,6 +331,9 @@ impl Projector {
             EventKind::IntegrationCandidateMaterialized => {
                 apply_integration_materialization(state, event)?
             }
+            EventKind::MemoryRevisionMaterialized => {
+                apply_memory_revision_materialization(state, event)?
+            }
             EventKind::ResponseProduced | EventKind::StateChanged => {}
         }
         state.revision += 1;
@@ -605,6 +608,7 @@ fn apply_position_integration(
     };
     let evidence_refs = crate::core::normalize_evidence_refs(materialization.evidence_refs.clone());
     if verification.new_disposition != VerificationDisposition::Verified
+        || verification.verification_event_id != Some(materialization.verification_event_id)
         || evidence_refs != verification.evidence_refs
         || !state
             .applied_events
@@ -1168,6 +1172,12 @@ fn apply_integration_transition(
             "integration verification actor does not match event actor",
         ));
     }
+    if verification
+        .verification_event_id
+        .is_some_and(|id| id != event.event_id)
+    {
+        return Err(error("integration verification event ID does not match"));
+    }
     if state
         .principals
         .get(&verification.actor_id)
@@ -1223,6 +1233,15 @@ fn apply_integration_transition(
         PositionIntegrationProposal::parse(&candidate.content)
             .map_err(|_| error("Position candidate has an invalid typed proposal"))?;
     }
+    if expected == VerificationDisposition::Verified
+        && matches!(
+            &candidate.kind,
+            crate::core::IntegrationCandidateKind::MemoryRevision
+        )
+    {
+        crate::core::MemoryRevisionProposal::parse(&candidate.content)
+            .map_err(|_| error("Memory revision candidate has an invalid typed proposal"))?;
+    }
     let evidence_refs = crate::core::normalize_evidence_refs(verification.evidence_refs.clone());
     if evidence_refs.is_empty() {
         return Err(error("integration verification needs evidence"));
@@ -1240,6 +1259,7 @@ fn apply_integration_transition(
     };
     candidate.disposition = expected;
     let mut stored = verification;
+    stored.verification_event_id = Some(event.event_id);
     stored.reason = stored.reason.trim().to_owned();
     stored.evidence_refs = evidence_refs;
     state
@@ -1352,6 +1372,164 @@ fn apply_integration_materialization(
     stored.evidence_refs = evidence_refs;
     state
         .integration_materializations
+        .insert(candidate_id, stored);
+    Ok(())
+}
+
+fn apply_memory_revision_materialization(
+    state: &mut CurrentState,
+    event: &ExperienceEvent,
+) -> Result<(), ProjectionError> {
+    let materialization: crate::core::MemoryRevisionMaterialization = payload(event)?;
+    let error = |message: &str| ProjectionError::InvalidPayload {
+        event_kind: format!("{:?}", event.event_kind),
+        message: message.to_owned(),
+    };
+    let candidate_id = materialization.candidate_id;
+    if event.subject.as_ref().map(|subject| {
+        subject.kind == crate::core::EntityKind::IntegrationCandidate
+            && subject.id == candidate_id.uuid()
+    }) != Some(true)
+        || event.source.source_type != "memory_integration"
+        || event.source.source_ref.as_deref() != Some(candidate_id.to_string().as_str())
+        || event.correlation_id.as_deref() != Some(candidate_id.to_string().as_str())
+        || event.causation_id != Some(materialization.verification_event_id)
+        || !state
+            .applied_events
+            .contains(&materialization.verification_event_id)
+        || !state
+            .applied_events
+            .contains(&materialization.expected_event_id)
+    {
+        return Err(error("Memory revision event provenance does not match"));
+    }
+    if !state.principals.contains_key(&event.actor_id) || is_model_actor(state, event.actor_id) {
+        return Err(error(
+            "model or unknown actor cannot materialize a Memory revision",
+        ));
+    }
+    let Some(candidate) = state.integration_candidates.get(&candidate_id).cloned() else {
+        return Err(error("Memory revision references an unknown candidate"));
+    };
+    if candidate.kind != crate::core::IntegrationCandidateKind::MemoryRevision
+        || candidate.disposition != VerificationDisposition::Verified
+        || state
+            .memory_revision_materializations
+            .contains_key(&candidate_id)
+        || crate::core::integration_candidate_fingerprint(
+            &candidate.kind,
+            &candidate.content,
+            &candidate.source_event_ids,
+            &candidate.counterevidence_event_ids,
+        ) != candidate.fingerprint
+        || materialization.fingerprint != candidate.fingerprint
+        || materialization.source_event_ids != candidate.source_event_ids
+        || materialization.counterevidence_event_ids != candidate.counterevidence_event_ids
+        || materialization.as_of_revision != candidate.as_of_revision
+        || !candidate
+            .counterevidence_event_ids
+            .contains(&materialization.expected_event_id)
+        || !crate::core::valid_sha256_hex(&materialization.expected_event_hash)
+    {
+        return Err(error(
+            "Memory revision materialization does not match candidate",
+        ));
+    }
+    let Some(verification) = state.integration_verifications.get(&candidate_id) else {
+        return Err(error("Memory revision has no verification record"));
+    };
+    let evidence_refs = crate::core::normalize_evidence_refs(materialization.evidence_refs.clone());
+    if verification.new_disposition != VerificationDisposition::Verified
+        || verification.verification_event_id != Some(materialization.verification_event_id)
+        || evidence_refs != verification.evidence_refs
+    {
+        return Err(error(
+            "Memory revision evidence does not match verification",
+        ));
+    }
+    let proposal = crate::core::MemoryRevisionProposal::parse(&candidate.content)
+        .map_err(|_| error("Memory revision proposal is invalid"))?;
+    let (target_id, expected_event_id, expected_event_hash) = match &proposal.operation {
+        crate::core::MemoryRevisionOperation::Replace {
+            target_memory_id,
+            expected_event_id,
+            expected_event_hash,
+            ..
+        }
+        | crate::core::MemoryRevisionOperation::Expire {
+            target_memory_id,
+            expected_event_id,
+            expected_event_hash,
+        } => (*target_memory_id, *expected_event_id, expected_event_hash),
+    };
+    if materialization.target_memory_id != target_id
+        || materialization.expected_event_id != expected_event_id
+        || materialization.expected_event_hash != *expected_event_hash
+    {
+        return Err(error("Memory revision target does not match proposal"));
+    }
+    let Some(target) = state.active_memories.get(&target_id) else {
+        return Err(error("Memory revision target is missing"));
+    };
+    if target.kind == crate::core::MemoryKind::ExplicitPreference {
+        return Err(error("explicit user preference cannot be revised"));
+    }
+    match materialization.action {
+        crate::core::MemoryRevisionActionKind::Replace => {
+            let Some(replacement_id) = materialization.replacement_memory_id else {
+                return Err(error("replacement Memory ID is missing"));
+            };
+            let Some(replacement) = state.active_memories.get(&replacement_id) else {
+                return Err(error("replacement Memory is missing"));
+            };
+            let Some(replacement_candidate) =
+                state.memory_candidates.get(&replacement.candidate_id)
+            else {
+                return Err(error("replacement Memory candidate is missing"));
+            };
+            if !matches!(
+                proposal.operation,
+                crate::core::MemoryRevisionOperation::Replace { .. }
+            ) || target.status != crate::core::ActiveMemoryStatus::Superseded
+                || replacement.status != crate::core::ActiveMemoryStatus::Active
+                || replacement.supersedes != Some(target_id)
+                || replacement.kind != target.kind
+                || replacement.subject_principal_id != target.subject_principal_id
+                || replacement_candidate.supersedes != Some(target.candidate_id)
+                || replacement_candidate.content
+                    != match &proposal.operation {
+                        crate::core::MemoryRevisionOperation::Replace {
+                            replacement_content,
+                            ..
+                        } => replacement_content.trim(),
+                        _ => "",
+                    }
+            {
+                return Err(error("replacement Memory transition is invalid"));
+            }
+        }
+        crate::core::MemoryRevisionActionKind::Expire => {
+            if !matches!(
+                proposal.operation,
+                crate::core::MemoryRevisionOperation::Expire { .. }
+            ) || materialization.replacement_memory_id.is_some()
+                || target.status != crate::core::ActiveMemoryStatus::Expired
+            {
+                return Err(error("Memory expiry transition is invalid"));
+            }
+        }
+    }
+    validate_integration_evidence(
+        state,
+        &candidate,
+        &evidence_refs,
+        materialization.as_of_revision,
+        &error,
+    )?;
+    let mut stored = materialization;
+    stored.evidence_refs = evidence_refs;
+    state
+        .memory_revision_materializations
         .insert(candidate_id, stored);
     Ok(())
 }

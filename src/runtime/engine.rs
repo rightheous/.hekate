@@ -40,9 +40,11 @@ use crate::runtime::memory_integration::{
     PositionIntegrationResult,
 };
 use crate::runtime::projector::{ProjectionError, Projector};
-use crate::runtime::recall::{SemanticRecall, DEFAULT_RECALL_LIMIT};
+use crate::runtime::recall::{
+    recall_local, SemanticRecall, DEFAULT_RECALL_LIMIT, FOREGROUND_RECALL_BUDGET,
+};
 use crate::runtime::recovery::{recover, RecoveryError, RecoveryReport};
-use crate::runtime::sleep::{SleepCoordinator, SleepOnceResult, SleepRuntimeError, SleepStatus};
+use crate::runtime::sleep::{SleepOnceResult, SleepRuntimeError, SleepStatus};
 
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -827,8 +829,6 @@ impl Engine {
             Some(decision_event.event_id),
         )?);
 
-        let mut indexed_events = vec![observation_event];
-        indexed_events.extend(final_events.iter().cloned());
         let state = match self
             .projector
             .record_batch(&final_events, Some(context.event_sequence), Some(&trace))
@@ -855,7 +855,7 @@ impl Engine {
             }
         };
 
-        self.index_best_effort(&state, &indexed_events).await;
+        self.index_best_effort();
 
         Ok(InteractionResult {
             observation_id: observation.id,
@@ -952,15 +952,6 @@ impl Engine {
             correlation_id,
             Some(decision_event.event_id),
         )?;
-        let indexed_events = events
-            .iter()
-            .filter(|event| {
-                event.correlation_id.as_deref()
-                    == Some(resolution.observation_id.to_string().as_str())
-            })
-            .cloned()
-            .chain([decision_event.clone(), response_event.clone()])
-            .collect::<Vec<_>>();
         let committed = self
             .projector
             .record_batch(
@@ -969,7 +960,7 @@ impl Engine {
                 None,
             )
             .await?;
-        self.index_best_effort(&committed, &indexed_events).await;
+        self.index_best_effort();
         Ok(InteractionResult {
             observation_id: observation.id,
             focus: resolution.focus,
@@ -1026,11 +1017,15 @@ impl Engine {
             text: text.to_owned(),
             limit: DEFAULT_RECALL_LIMIT,
             exclude_event_ids: vec![observation_event_id],
+            as_of_sequence: Some(state.revision),
         };
         let Some(recall) = self.recall.as_ref() else {
-            return RecallBundle::empty(query.query_hash(), "");
+            return recall_local(&query, state, events);
         };
-        match recall.recall(&query, state, events).await {
+        match recall
+            .recall_with_budget(&query, state, events, FOREGROUND_RECALL_BUDGET)
+            .await
+        {
             Ok(bundle) => bundle,
             Err(error) => {
                 tracing::warn!(
@@ -1038,22 +1033,64 @@ impl Engine {
                     error = %error,
                     "semantic recall unavailable"
                 );
-                RecallBundle::empty(query.query_hash(), recall.embedding_space_id())
+                recall_local(&query, state, events)
             }
         }
     }
 
-    async fn index_best_effort(&self, state: &CurrentState, events: &[ExperienceEvent]) {
-        let Some(recall) = self.recall.as_ref() else {
+    fn index_best_effort(&self) {
+        let Some(recall) = self.recall.clone() else {
             return;
         };
-        if let Err(error) = recall.index_events(state, events).await {
-            tracing::warn!(
-                event_count = events.len(),
-                error = %error,
-                "incremental semantic indexing skipped"
-            );
-        }
+        let storage = self.storage.clone();
+        tokio::spawn(async move {
+            for attempt in 0..3 {
+                let result: Result<bool, String> = async {
+                    let state = storage
+                        .load_state()
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    let events = storage
+                        .load_events()
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    if state.revision != events.len() as u64 {
+                        return Err("state and ledger revisions differ".to_owned());
+                    }
+                    tokio::time::timeout(
+                        Duration::from_secs(5),
+                        recall.index_once(&state, &events),
+                    )
+                    .await
+                    .map_err(|_| "semantic indexing timed out".to_owned())?
+                    .map_err(|error| error.to_string())?;
+                    let latest = storage
+                        .load_state()
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    Ok(latest.revision == state.revision)
+                }
+                .await;
+                match result {
+                    Ok(true) => return,
+                    Ok(false) => {
+                        tracing::debug!(
+                            attempt = attempt + 1,
+                            "semantic index snapshot was stale; retrying"
+                        );
+                        if attempt < 2 {
+                            tokio::time::sleep(Duration::from_millis(250 * (attempt + 1))).await;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(attempt = attempt + 1, %error, "background semantic indexing failed");
+                        if attempt < 2 {
+                            tokio::time::sleep(Duration::from_millis(250 * (attempt + 1))).await;
+                        }
+                    }
+                }
+            }
+        });
     }
 
     pub async fn execute_capability(
@@ -1084,7 +1121,7 @@ impl Engine {
     }
 
     pub async fn sleep_once(&self) -> Result<SleepOnceResult, EngineError> {
-        Ok(SleepCoordinator::new(
+        Ok(crate::runtime::consolidation::sleep_once(
             self.storage.as_ref(),
             &self.projector,
             self.sleep_model.as_deref(),
@@ -1092,7 +1129,6 @@ impl Engine {
             self.hekate_id,
             self.user_id,
         )
-        .sleep_once()
         .await?)
     }
 
@@ -1165,10 +1201,13 @@ impl Engine {
         &self,
         candidate_id: IntegrationCandidateId,
     ) -> Result<MemoryIntegrationResult, EngineError> {
-        let commit = MemoryIntegration::new(self.storage.clone())
-            .materialize_memory(candidate_id, self.user_id)
-            .await?;
-        self.index_best_effort(&commit.state, &commit.events).await;
+        let commit = crate::runtime::consolidation::integrate_memory(
+            self.storage.clone(),
+            candidate_id,
+            self.user_id,
+        )
+        .await?;
+        self.index_best_effort();
         Ok(commit.result)
     }
 
@@ -1176,10 +1215,14 @@ impl Engine {
         &self,
         candidate_id: IntegrationCandidateId,
     ) -> Result<PositionIntegrationResult, EngineError> {
-        let commit = MemoryIntegration::new(self.storage.clone())
-            .materialize_position(candidate_id, self.hekate_id, self.user_id)
-            .await?;
-        self.index_best_effort(&commit.state, &commit.events).await;
+        let commit = crate::runtime::consolidation::integrate_position(
+            self.storage.clone(),
+            candidate_id,
+            self.hekate_id,
+            self.user_id,
+        )
+        .await?;
+        self.index_best_effort();
         Ok(commit.result)
     }
 
@@ -1399,11 +1442,10 @@ impl Engine {
         } else {
             vec![promoted_event]
         };
-        let committed_state = self
-            .projector
+        self.projector
             .record_batch(&events, Some(state.revision), None)
             .await?;
-        self.index_best_effort(&committed_state, &events).await;
+        self.index_best_effort();
         Ok(memory)
     }
 
@@ -1481,12 +1523,10 @@ impl Engine {
             None,
             None,
         )?;
-        let committed_state = self
-            .projector
+        self.projector
             .record_batch(std::slice::from_ref(&event), Some(state.revision), None)
             .await?;
-        self.index_best_effort(&committed_state, std::slice::from_ref(&event))
-            .await;
+        self.index_best_effort();
         Ok(memory)
     }
 

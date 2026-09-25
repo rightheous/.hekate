@@ -160,6 +160,8 @@ fn selection_is_deterministic_and_drops_whole_low_priority_items() {
         items: vec![RecalledItem {
             entity: EntityRef::new(EntityKind::Observation, old_observation.id.uuid()),
             source_event_id: events[2].event_id,
+            source_hash: events[2].canonical_hash().expect("source hash"),
+            as_of_sequence: state.revision,
             text: "historical recall ".repeat(800),
             score: 0.9,
             created_at: "2026-01-01T00:00:00Z".to_owned(),
@@ -284,6 +286,8 @@ fn invalid_revision_provenance_and_anchor_budget_fail_closed_without_mutation() 
             items: vec![RecalledItem {
                 entity: EntityRef::new(EntityKind::IdentityVersion, identity.id.uuid()),
                 source_event_id: future_event.event_id,
+                source_hash: future_event.canonical_hash().expect("source hash"),
+                as_of_sequence: 2,
                 text: "future".to_owned(),
                 score: 1.0,
                 created_at: String::new(),
@@ -311,6 +315,8 @@ fn invalid_revision_provenance_and_anchor_budget_fail_closed_without_mutation() 
             items: vec![RecalledItem {
                 entity: EntityRef::new(EntityKind::IdentityVersion, identity.id.uuid()),
                 source_event_id: corrupted.event_id,
+                source_hash: identity_event.canonical_hash().expect("source hash"),
+                as_of_sequence: 1,
                 text: "corrupted".to_owned(),
                 score: 1.0,
                 created_at: String::new(),
@@ -321,6 +327,50 @@ fn invalid_revision_provenance_and_anchor_budget_fail_closed_without_mutation() 
     assert!(matches!(
         build_context_snapshot(&state, &[corrupted], &hash_request),
         Err(ContextBuilderError::SourceHashMismatch { .. })
+    ));
+    let mismatch_request = request(
+        principal_id,
+        1,
+        RecallBundle {
+            query_hash: String::new(),
+            embedding_space_id: String::new(),
+            items: vec![RecalledItem {
+                entity: EntityRef::new(EntityKind::IdentityVersion, identity.id.uuid()),
+                source_event_id: identity_event.event_id,
+                source_hash: "0".repeat(64),
+                as_of_sequence: 1,
+                text: "mismatched hash".to_owned(),
+                score: 1.0,
+                created_at: String::new(),
+            }],
+        },
+        ContextBudget::default(),
+    );
+    assert!(matches!(
+        build_context_snapshot(&state, &[identity_event.clone()], &mismatch_request),
+        Err(ContextBuilderError::SourceHashMismatch { .. })
+    ));
+    let future_as_of_request = request(
+        principal_id,
+        1,
+        RecallBundle {
+            query_hash: String::new(),
+            embedding_space_id: String::new(),
+            items: vec![RecalledItem {
+                entity: EntityRef::new(EntityKind::IdentityVersion, identity.id.uuid()),
+                source_event_id: identity_event.event_id,
+                source_hash: identity_event.canonical_hash().expect("source hash"),
+                as_of_sequence: 2,
+                text: "future recall as-of".to_owned(),
+                score: 1.0,
+                created_at: String::new(),
+            }],
+        },
+        ContextBudget::default(),
+    );
+    assert!(matches!(
+        build_context_snapshot(&state, &[identity_event.clone()], &future_as_of_request),
+        Err(ContextBuilderError::InvalidRecallAsOf { .. })
     ));
     assert_eq!(state, before_state);
 }

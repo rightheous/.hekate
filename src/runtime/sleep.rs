@@ -15,7 +15,7 @@ use crate::core::{
 };
 use crate::ports::{SleepCognitiveModel, Storage, StorageError};
 use crate::runtime::projector::{ProjectionError, Projector};
-use crate::runtime::recall::SemanticRecall;
+use crate::runtime::recall::{recall_local, SemanticRecall, BACKGROUND_RECALL_BUDGET};
 
 #[derive(Debug, Error)]
 pub enum SleepRuntimeError {
@@ -375,40 +375,46 @@ impl<'a> SleepCoordinator<'a> {
             .map(|(index, event)| (event.event_id, index as u64 + 1))
             .collect::<HashMap<_, _>>();
         let mut recalled = HashMap::<EventId, RecalledItem>::new();
-        if let Some(recall) = self.recall {
-            for seed in seeds {
-                let query = RecallQuery {
-                    text: seed.observation.content.clone(),
-                    limit: 6,
-                    exclude_event_ids: seed_ids.clone(),
-                };
-                let bundle = match recall.recall(&query, state, events).await {
+        for seed in seeds {
+            let query = RecallQuery {
+                text: seed.observation.content.clone(),
+                limit: 6,
+                exclude_event_ids: seed_ids.clone(),
+                as_of_sequence: Some(run.high_water_revision),
+            };
+            let bundle = if let Some(recall) = self.recall {
+                match recall
+                    .recall_with_budget(&query, state, events, BACKGROUND_RECALL_BUDGET)
+                    .await
+                {
                     Ok(bundle) => bundle,
                     Err(error) => {
                         tracing::warn!(
                             sleep_run_id = %run.id,
                             error = %error,
-                            "sleep semantic recall unavailable"
+                            "sleep semantic recall unavailable; using local recall"
                         );
-                        continue;
+                        recall_local(&query, state, events)
                     }
-                };
-                for item in bundle.items {
-                    if seed_ids.contains(&item.source_event_id)
-                        || sequence_by_id
-                            .get(&item.source_event_id)
-                            .map(|sequence| *sequence > run.high_water_revision)
-                            .unwrap_or(true)
-                    {
-                        continue;
-                    }
-                    let replace = recalled
+                }
+            } else {
+                recall_local(&query, state, events)
+            };
+            for item in bundle.items {
+                if seed_ids.contains(&item.source_event_id)
+                    || sequence_by_id
                         .get(&item.source_event_id)
-                        .map(|existing| item.score > existing.score)
-                        .unwrap_or(true);
-                    if replace {
-                        recalled.insert(item.source_event_id, item);
-                    }
+                        .map(|sequence| *sequence > run.high_water_revision)
+                        .unwrap_or(true)
+                {
+                    continue;
+                }
+                let replace = recalled
+                    .get(&item.source_event_id)
+                    .map(|existing| item.score > existing.score)
+                    .unwrap_or(true);
+                if replace {
+                    recalled.insert(item.source_event_id, item);
                 }
             }
         }
@@ -891,6 +897,52 @@ fn validate_deliberation(
             .any(|event_id| counterevidence_event_ids.contains(event_id))
         {
             return Err("candidate source and counterevidence overlap".to_owned());
+        }
+        if matches!(
+            &draft.kind,
+            crate::core::IntegrationCandidateKind::MemoryRevision
+        ) {
+            let proposal = crate::core::MemoryRevisionProposal::parse(&draft.content)?;
+            let (target_id, expected_event_id, expected_event_hash) = match &proposal.operation {
+                crate::core::MemoryRevisionOperation::Replace {
+                    target_memory_id,
+                    expected_event_id,
+                    expected_event_hash,
+                    ..
+                }
+                | crate::core::MemoryRevisionOperation::Expire {
+                    target_memory_id,
+                    expected_event_id,
+                    expected_event_hash,
+                } => (*target_memory_id, *expected_event_id, expected_event_hash),
+            };
+            let recalled_target = context.recalled_experiences.iter().any(|item| {
+                item.entity.kind == EntityKind::Memory
+                    && item.entity.id == target_id.uuid()
+                    && item.source_event_id == expected_event_id
+                    && item.source_hash == *expected_event_hash
+                    && item.as_of_sequence == context.high_water_revision
+            });
+            if !recalled_target
+                || !counterevidence_event_ids.contains(&expected_event_id)
+                || !source_event_ids.iter().any(|event_id| {
+                    context
+                        .seed_observations
+                        .iter()
+                        .any(|seed| seed.event_id == *event_id)
+                })
+            {
+                return Err(
+                    "Memory revision target or new evidence is outside the Sleep context"
+                        .to_owned(),
+                );
+            }
+            if state.active_memories.get(&target_id).is_none_or(|memory| {
+                memory.status != crate::core::ActiveMemoryStatus::Active
+                    || memory.kind == crate::core::MemoryKind::ExplicitPreference
+            }) {
+                continue;
+            }
         }
         let fingerprint = integration_candidate_fingerprint(
             &draft.kind,

@@ -59,6 +59,7 @@ pub enum EventKind {
     IntegrationCandidateVerified,
     IntegrationCandidateRejected,
     IntegrationCandidateMaterialized,
+    MemoryRevisionMaterialized,
     CompletionCriterionDefined,
     CompletionClaimCreated,
     CompletionClaimVerified,

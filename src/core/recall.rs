@@ -8,6 +8,8 @@ pub struct RecallQuery {
     pub text: String,
     pub limit: usize,
     pub exclude_event_ids: Vec<EventId>,
+    #[serde(default)]
+    pub as_of_sequence: Option<u64>,
 }
 
 impl RecallQuery {
@@ -20,6 +22,10 @@ impl RecallQuery {
 pub struct RecalledItem {
     pub entity: EntityRef,
     pub source_event_id: EventId,
+    #[serde(default)]
+    pub source_hash: String,
+    #[serde(default)]
+    pub as_of_sequence: u64,
     pub text: String,
     pub score: f32,
     pub created_at: String,

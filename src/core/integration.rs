@@ -7,6 +7,7 @@ use super::{
 };
 
 pub const POSITION_INTEGRATION_SCHEMA: &str = "hekate.position_integration.v1";
+pub const MEMORY_REVISION_SCHEMA: &str = "hekate.memory_revision.v1";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
@@ -36,6 +37,84 @@ pub enum PositionIntegrationOperation {
 pub struct PositionIntegrationProposal {
     pub schema: String,
     pub operation: PositionIntegrationOperation,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MemoryRevisionOperation {
+    Replace {
+        target_memory_id: MemoryId,
+        expected_event_id: EventId,
+        expected_event_hash: String,
+        replacement_content: String,
+    },
+    Expire {
+        target_memory_id: MemoryId,
+        expected_event_id: EventId,
+        expected_event_hash: String,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryRevisionProposal {
+    pub schema: String,
+    pub operation: MemoryRevisionOperation,
+}
+
+impl MemoryRevisionProposal {
+    pub fn parse(content: &str) -> Result<Self, String> {
+        let proposal: Self = serde_json::from_str(content).map_err(|error| error.to_string())?;
+        if proposal.schema != MEMORY_REVISION_SCHEMA {
+            return Err("schema must be hekate.memory_revision.v1".to_owned());
+        }
+        let (event_hash, replacement) = match &proposal.operation {
+            MemoryRevisionOperation::Replace {
+                expected_event_hash,
+                replacement_content,
+                ..
+            } => (expected_event_hash, Some(replacement_content)),
+            MemoryRevisionOperation::Expire {
+                expected_event_hash,
+                ..
+            } => (expected_event_hash, None),
+        };
+        if !crate::core::valid_sha256_hex(event_hash) {
+            return Err("expected_event_hash must be a SHA-256 hash".to_owned());
+        }
+        if let Some(replacement) = replacement {
+            if replacement.trim().is_empty() || replacement.trim().len() > MAX_SLEEP_TEXT {
+                return Err(format!(
+                    "replacement_content must be non-empty and at most {MAX_SLEEP_TEXT} bytes"
+                ));
+            }
+        }
+        Ok(proposal)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryRevisionActionKind {
+    Replace,
+    Expire,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MemoryRevisionMaterialization {
+    pub candidate_id: IntegrationCandidateId,
+    pub verification_event_id: EventId,
+    pub target_memory_id: MemoryId,
+    pub replacement_memory_id: Option<MemoryId>,
+    pub expected_event_id: EventId,
+    pub expected_event_hash: String,
+    pub action: MemoryRevisionActionKind,
+    pub source_event_ids: Vec<EventId>,
+    pub counterevidence_event_ids: Vec<EventId>,
+    pub evidence_refs: Vec<EvidenceRef>,
+    pub fingerprint: String,
+    pub as_of_revision: ExistingRevisionType,
+    pub created_at: String,
 }
 
 impl PositionIntegrationProposal {
@@ -113,6 +192,8 @@ pub enum PositionIntegrationActionKind {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct IntegrationVerification {
     pub candidate_id: IntegrationCandidateId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_event_id: Option<EventId>,
     pub previous_disposition: VerificationDisposition,
     pub new_disposition: VerificationDisposition,
     pub actor_id: PrincipalId,
@@ -156,6 +237,13 @@ pub struct PositionIntegrationEventPayload {
     #[serde(flatten)]
     pub position: Position,
     pub position_integration: PositionIntegrationMaterialization,
+}
+
+pub fn memory_revision_blocked(state: &CurrentState, memory_id: MemoryId) -> bool {
+    state.active_memories.get(&memory_id).is_some_and(|memory| {
+        memory.status == crate::core::ActiveMemoryStatus::Active
+            && memory.kind == crate::core::MemoryKind::ExplicitPreference
+    })
 }
 
 pub fn position_integration_blocked(
