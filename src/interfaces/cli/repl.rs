@@ -160,12 +160,12 @@ impl Repl<'_> {
     }
 
     async fn show_one_initiative(&mut self) -> anyhow::Result<()> {
-        let Some(proposal) = self.initiatives.ready_for_display().await? else {
+        let Some(proposal) = self.initiatives.list().await?.into_iter().find(|proposal| {
+            proposal.status == crate::core::InitiativeStatus::Ready
+                && self.shown_initiative != Some(proposal.id)
+        }) else {
             return Ok(());
         };
-        if self.shown_initiative == Some(proposal.id) {
-            return Ok(());
-        }
         self.shown_initiative = Some(proposal.id);
         if self.json {
             print_json(&serde_json::json!({

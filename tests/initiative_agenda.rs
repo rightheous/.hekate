@@ -115,9 +115,9 @@ fn position(
     }
 }
 
-fn add_position(events: &mut Vec<ExperienceEvent>, hekate_id: PrincipalId, value: &Position) {
+fn add_position(events: &mut Vec<ExperienceEvent>, actor_id: PrincipalId, value: &Position) {
     events.push(event(
-        hekate_id,
+        actor_id,
         EventKind::PositionEstablished,
         EntityKind::Position,
         value.id.uuid(),
@@ -172,16 +172,25 @@ fn conflict_fixture() -> (
 ) {
     let (hekate_id, user_id, mut events) = base();
     let source = observation_event(&mut events, user_id, 10, "workspace retention evidence");
-    let position = position(20, hekate_id, "workspace retention", vec![source]);
-    add_position(&mut events, hekate_id, &position);
+    let hekate_position = position(20, hekate_id, "workspace retention", vec![source]);
+    let user_position = position(21, user_id, "workspace retention", vec![source]);
+    add_position(&mut events, hekate_id, &hekate_position);
+    add_position(&mut events, user_id, &user_position);
     let conflict = conflict(
         30,
-        vec![position.id],
+        vec![hekate_position.id, user_position.id],
         vec![source],
         "Should we retain the current workspace?",
     );
     add_conflict(&mut events, hekate_id, &conflict);
-    (hekate_id, user_id, position, conflict, source, events)
+    (
+        hekate_id,
+        user_id,
+        hekate_position,
+        conflict,
+        source,
+        events,
+    )
 }
 
 #[test]
@@ -223,10 +232,20 @@ fn missing_or_invalid_evidence_and_user_positions_do_not_create_conflict_candida
     let (hekate_id, user_id, hekate_position, _, source, mut events) = conflict_fixture();
     let no_evidence = conflict(31, vec![hekate_position.id], Vec::new(), "What changed?");
     add_conflict(&mut events, hekate_id, &no_evidence);
+    let unrelated_conflict = conflict(
+        32,
+        vec![hekate_position.id],
+        vec![source],
+        "Does this unrelated conflict affect the user?",
+    );
+    add_conflict(&mut events, hekate_id, &unrelated_conflict);
     let state = replay(&events);
     assert!(select(&state, &events, hekate_id, user_id)
         .iter()
         .all(|candidate| candidate.source_entity.id != no_evidence.id.uuid()));
+    assert!(select(&state, &events, hekate_id, user_id)
+        .iter()
+        .all(|candidate| candidate.source_entity.id != unrelated_conflict.id.uuid()));
 
     let tampered = events
         .iter()
@@ -449,12 +468,14 @@ fn ordering_is_stable_prioritized_capped_and_fingerprint_ignores_revision() {
     let (hekate_id, user_id, mut events) = base();
     let source = observation_event(&mut events, user_id, 80, "workspace retention source");
     let hekate_position = position(81, hekate_id, "position unrelated", vec![source]);
+    let user_position = position(82, user_id, "position unrelated", vec![source]);
     add_position(&mut events, hekate_id, &hekate_position);
+    add_position(&mut events, user_id, &user_position);
 
     for conflict_id in 100..106 {
         let value = conflict(
             conflict_id,
-            vec![hekate_position.id],
+            vec![hekate_position.id, user_position.id],
             vec![source],
             "Should the workspace be retained?",
         );
@@ -522,7 +543,7 @@ fn ordering_is_stable_prioritized_capped_and_fingerprint_ignores_revision() {
     for conflict_id in 106..110 {
         let value = conflict(
             conflict_id,
-            vec![hekate_position.id],
+            vec![hekate_position.id, user_position.id],
             vec![source],
             "Should the workspace be retained?",
         );

@@ -217,7 +217,15 @@ fn add_conflict_candidates(
                 && current_position_sequence(position, ledger)
                     .is_some_and(|sequence| sequence < conflict_sequence)
         });
-        if !hekate_participates {
+        let user_participates = conflict.participant_positions.iter().any(|position_id| {
+            let Some(position) = state.positions.get(position_id) else {
+                return false;
+            };
+            position.principal_id == user_id
+                && current_position_sequence(position, ledger)
+                    .is_some_and(|sequence| sequence < conflict_sequence)
+        });
+        if !hekate_participates || !user_participates {
             continue;
         }
         let sources = bounded_valid_event_ids(

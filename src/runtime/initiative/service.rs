@@ -8,8 +8,8 @@ use crate::core::event::{
     EntityKind, EntityRef, EventError, EventKind, EventSource, ExperienceEvent,
 };
 use crate::core::{
-    initiative_fingerprint, now, AgendaCandidate, CurrentState, EventId, InitiativeProposal,
-    InitiativeStatus, PrincipalId, PrincipalKind,
+    initiative_fingerprint, now, AgendaCandidate, Commitment, CurrentState, EventId,
+    InitiativeProposal, InitiativeStatus, PrincipalId, PrincipalKind,
 };
 use crate::ports::{Storage, StorageError};
 use crate::runtime::projector::{ProjectionError, Projector};
@@ -65,6 +65,7 @@ impl InitiativeService {
             .await?
             .initiatives
             .into_values()
+            .filter(|proposal| proposal.target_principal_id == self.user_id)
             .collect())
     }
 
@@ -81,13 +82,21 @@ impl InitiativeService {
             Err(InitiativeError::StaleSnapshot) => return Ok(InitiativeRunResult::Deferred),
             Err(error) => return Err(error),
         };
-        let Some(candidate) = super::agenda::select(&state, &events, self.hekate_id, self.user_id)
-            .into_iter()
-            .next()
-        else {
+        let candidates = super::agenda::select(&state, &events, self.hekate_id, self.user_id);
+        let Some(candidate) = candidates.iter().find(|candidate| {
+            !state
+                .initiatives
+                .values()
+                .any(|proposal| proposal.fingerprint == candidate.fingerprint)
+        }) else {
+            if let Some(candidate) = candidates.first() {
+                return Ok(InitiativeRunResult::Duplicate {
+                    fingerprint: candidate.fingerprint.clone(),
+                });
+            }
             return Ok(InitiativeRunResult::NoCandidate);
         };
-        self.propose_candidate(candidate).await
+        self.propose_candidate(candidate.clone()).await
     }
 
     /// Revalidates a selector result immediately before its event batch is committed.
@@ -112,7 +121,7 @@ impl InitiativeService {
         if candidate.as_of_revision != state.revision {
             return Ok(InitiativeRunResult::Deferred);
         }
-        validate_candidate(&state, &events, &candidate, self.user_id)?;
+        validate_candidate(&state, &events, &candidate, self.hekate_id, self.user_id)?;
         if self.storage.has_active_foreground_lease().await? {
             return Ok(InitiativeRunResult::Deferred);
         }
@@ -216,9 +225,24 @@ fn validate_candidate(
     state: &CurrentState,
     events: &[ExperienceEvent],
     candidate: &AgendaCandidate,
+    hekate_id: PrincipalId,
     user_id: PrincipalId,
 ) -> Result<(), InitiativeError> {
     let reject = |message: &str| InitiativeError::InvalidCandidate(message.to_owned());
+    if !state
+        .principals
+        .get(&hekate_id)
+        .is_some_and(|principal| matches!(principal.kind, PrincipalKind::Hekate))
+    {
+        return Err(reject("configured HEKATE principal is missing or invalid"));
+    }
+    if !state
+        .principals
+        .get(&user_id)
+        .is_some_and(|principal| matches!(principal.kind, PrincipalKind::User))
+    {
+        return Err(reject("configured target principal is missing or invalid"));
+    }
     if candidate.target_principal_id != user_id {
         return Err(reject("candidate target is not the configured user"));
     }
@@ -241,27 +265,17 @@ fn validate_candidate(
             "candidate fingerprint does not match its provenance",
         ));
     }
-    let mut latest_source_event = None;
     for event in events {
-        if event.subject.as_ref() == Some(&candidate.source_entity) {
-            latest_source_event = Some(event.event_id);
+        if !event.verify_integrity()? {
+            return Err(reject("ledger event integrity check failed"));
         }
-    }
-    let Some(latest_source_event) = latest_source_event else {
-        return Err(reject("source entity has no ledger events"));
-    };
-    if !candidate.source_event_ids.contains(&latest_source_event) {
-        return Err(reject("evidence omits the latest source entity event"));
     }
     for event_id in &candidate.source_event_ids {
-        let Some(event) = events.iter().find(|event| event.event_id == *event_id) else {
+        if !events.iter().any(|event| event.event_id == *event_id) {
             return Err(reject("evidence event is not in the current ledger"));
-        };
-        if !event.verify_integrity()? {
-            return Err(reject("evidence event integrity check failed"));
         }
     }
-    if !source_owned_by(state, &candidate.source_entity, user_id) {
+    if !source_owned_by(state, &candidate.source_entity, user_id, hekate_id) {
         return Err(reject(
             "source entity is not owned by or addressed to the target",
         ));
@@ -272,6 +286,11 @@ fn validate_candidate(
     if candidate.source_version != version {
         return Err(reject("source entity version changed"));
     }
+    if !super::agenda::select(state, events, hekate_id, user_id).contains(candidate) {
+        return Err(reject(
+            "candidate does not match the current verified Agenda selection",
+        ));
+    }
     Ok(())
 }
 
@@ -280,6 +299,32 @@ fn source_version(
     events: &[ExperienceEvent],
     source: &EntityRef,
 ) -> Option<u64> {
+    if source.kind == EntityKind::Commitment {
+        let commitment = state.commitments.get(&source.id.into())?;
+        let (sequence, event, projected) = events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| {
+                event.subject.as_ref() == Some(source)
+                    && matches!(
+                        event.event_kind,
+                        EventKind::CommitmentCreated | EventKind::CommitmentFulfilled
+                    )
+            })
+            .filter_map(|(index, event)| {
+                let projected = serde_json::from_value::<Commitment>(event.payload.clone()).ok()?;
+                (projected.id.uuid() == source.id).then_some((index as u64 + 1, event, projected))
+            })
+            .max_by_key(|(sequence, _, _)| *sequence)?;
+        if event.verify_integrity().ok() != Some(true)
+            || projected != *commitment
+            || event.event_kind != EventKind::CommitmentCreated
+        {
+            return None;
+        }
+        return Some(sequence);
+    }
+
     let explicit = match source.kind {
         EntityKind::IdentityVersion => state
             .identity_versions
@@ -305,7 +350,12 @@ fn source_version(
     })
 }
 
-fn source_owned_by(state: &CurrentState, source: &EntityRef, target: PrincipalId) -> bool {
+fn source_owned_by(
+    state: &CurrentState,
+    source: &EntityRef,
+    target: PrincipalId,
+    hekate: PrincipalId,
+) -> bool {
     match source.kind {
         EntityKind::Principal => {
             source.id == target.uuid()
@@ -366,7 +416,7 @@ fn source_owned_by(state: &CurrentState, source: &EntityRef, target: PrincipalId
         EntityKind::Position => state
             .positions
             .get(&source.id.into())
-            .is_some_and(|item| item.principal_id == target),
+            .is_some_and(|item| item.principal_id == target || item.principal_id == hekate),
         EntityKind::Conflict => state
             .conflicts
             .get(&source.id.into())

@@ -93,6 +93,8 @@ pub struct Cli {
     #[arg(long)]
     pub sleep_worker: bool,
     #[arg(long)]
+    pub initiative_worker: bool,
+    #[arg(long)]
     pub initiative_once: bool,
     #[arg(long)]
     pub initiatives: bool,
@@ -128,6 +130,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     }
     validate_sleep_args(&cli)?;
     validate_initiative_args(&cli)?;
+    validate_initiative_worker_args(&cli)?;
     validate_integration_args(&cli)?;
     if cli.sleep_worker {
         validate_sleep_worker_args(&cli)?;
@@ -171,24 +174,32 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             config.hekate_principal_id,
             config.user_principal_id,
         );
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let worker = InitiativeWorker::new(
-            initiative_service.clone(),
-            InitiativeWorkerConfig::default(),
-        )?;
-        let worker_task = tokio::spawn(async move {
-            worker.run_until_shutdown(shutdown_rx).await;
-        });
+        let worker = if cli.initiative_worker {
+            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+            let worker = InitiativeWorker::new(
+                initiative_service.clone(),
+                InitiativeWorkerConfig::default(),
+            )?;
+            Some((
+                shutdown_tx,
+                tokio::spawn(async move {
+                    worker.run_until_shutdown(shutdown_rx).await;
+                }),
+            ))
+        } else {
+            None
+        };
         let thread_id = cli
             .thread_id
             .clone()
             .unwrap_or_else(|| format!("cli-{}", Uuid::new_v4()));
         let result = repl::run(&engine, thread_id, initiative_service).await;
-        let _ = shutdown_tx.send(true);
-        let worker_result = worker_task.await;
+        if let Some((shutdown_tx, worker_task)) = worker {
+            let _ = shutdown_tx.send(true);
+            worker_task.await?;
+        }
         let shutdown = engine.shutdown().await;
         result?;
-        worker_result?;
         shutdown?;
         return Ok(());
     }
@@ -251,6 +262,7 @@ fn validate_initiative_args(cli: &Cli) -> anyhow::Result<()> {
         || cli.sleep_once
         || cli.sleep_status
         || cli.sleep_worker
+        || cli.initiative_worker
         || cli.integration_candidates
         || cli.verify_integration.is_some()
         || cli.reject_integration.is_some()
@@ -269,6 +281,13 @@ fn validate_initiative_args(cli: &Cli) -> anyhow::Result<()> {
         || cli.execute.is_some();
     if other_command {
         anyhow::bail!("initiative commands cannot be combined with another command or MESSAGE");
+    }
+    Ok(())
+}
+
+fn validate_initiative_worker_args(cli: &Cli) -> anyhow::Result<()> {
+    if cli.initiative_worker && !cli.chat {
+        anyhow::bail!("--initiative-worker requires --chat");
     }
     Ok(())
 }
@@ -1097,5 +1116,31 @@ mod tests {
             "I cannot agree that 2+2=5 is true."
         );
         assert!(value["observation_id"].is_string());
+    }
+
+    #[test]
+    fn initiative_worker_is_opt_in_for_chat() {
+        let chat = Cli::try_parse_from(["hekate", "--chat"]).expect("chat args");
+        assert!(!chat.initiative_worker);
+        validate_initiative_worker_args(&chat).expect("default chat args");
+
+        let enabled =
+            Cli::try_parse_from(["hekate", "--chat", "--initiative-worker"]).expect("opt-in args");
+        validate_initiative_worker_args(&enabled).expect("opt-in worker");
+
+        let invalid = Cli::try_parse_from(["hekate", "--initiative-worker"]).expect("worker args");
+        assert!(validate_initiative_worker_args(&invalid).is_err());
+    }
+
+    #[test]
+    fn initiative_once_rejects_resume_and_other_commands() {
+        for args in [
+            vec!["hekate", "--initiative-once", "--resume"],
+            vec!["hekate", "--initiative-once", "--chat"],
+            vec!["hekate", "--initiative-once", "--initiative-worker"],
+        ] {
+            let cli = Cli::try_parse_from(args).expect("initiative command args");
+            assert!(validate_initiative_args(&cli).is_err());
+        }
     }
 }
