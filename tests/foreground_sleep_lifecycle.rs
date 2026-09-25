@@ -1,5 +1,5 @@
 use std::fs;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
@@ -22,7 +22,7 @@ use hekate::ports::{
     SleepCognitiveError, SleepCognitiveModel, Storage,
 };
 use hekate::runtime::{Engine, EngineError, Projector, SleepOnceStatus};
-use tokio::sync::Notify;
+use tokio::sync::{Barrier, Notify};
 use uuid::Uuid;
 
 struct NoCapabilities {
@@ -145,6 +145,18 @@ impl CognitiveModel for ForegroundModel {
             },
             commitment,
         })
+    }
+}
+
+struct KilledForegroundModel {
+    ready_path: String,
+}
+
+#[async_trait]
+impl CognitiveModel for KilledForegroundModel {
+    async fn think(&self, _: &ThoughtContext) -> Result<ThoughtCycle, CognitiveError> {
+        fs::write(&self.ready_path, "ready").expect("write child ready marker");
+        std::future::pending().await
     }
 }
 
@@ -436,13 +448,17 @@ async fn run_timeout_retry_scenario() -> EvalCase {
         first_sleep,
         unused_calls(),
     );
-    let observation = message_observation("retry this message", "message-17");
+    let observation = message_observation("new task: retry this message", "message-17");
     assert!(matches!(
         first_engine.handle(observation.clone()).await,
         Err(EngineError::Cognitive(CognitiveError::Timeout { .. }))
     ));
     let after_timeout = first_store.state().await.expect("failed state");
     assert_eq!(after_timeout.observations.len(), 1);
+    assert_eq!(after_timeout.runs.len(), 1);
+    assert_eq!(after_timeout.tasks.len(), 1);
+    assert_eq!(after_timeout.goals.len(), 1);
+    let original_run_id = after_timeout.runs.values().next().expect("original run").id;
     assert!(matches!(
         after_timeout
             .attempts
@@ -469,6 +485,11 @@ async fn run_timeout_retry_scenario() -> EvalCase {
         .handle(observation.clone())
         .await
         .expect("retry without a committed decision");
+    assert_eq!(retried.focus.run_id, Some(original_run_id));
+    let after_retry = restarted_store.state().await.expect("retried state");
+    assert_eq!(after_retry.runs.len(), 1);
+    assert_eq!(after_retry.tasks.len(), 1);
+    assert_eq!(after_retry.goals.len(), 1);
     let repeated = restarted
         .handle(observation)
         .await
@@ -849,6 +870,151 @@ async fn lifecycle_contract_scenarios_pass() {
     ] {
         assert!(case.projection_verified, "{} replay", case.scenario);
     }
+}
+
+#[tokio::test]
+async fn concurrent_foreground_lease_acquisition_has_one_winner() {
+    let url = database_url("single-lease");
+    let first = SqliteStore::open(&url).await.expect("first store");
+    let second = SqliteStore::open(&url).await.expect("second store");
+    let barrier = Arc::new(Barrier::new(3));
+    let first_task = {
+        let barrier = barrier.clone();
+        tokio::spawn(async move {
+            barrier.wait().await;
+            first
+                .acquire_foreground_lease("owner-a", Duration::from_secs(5))
+                .await
+                .expect("first acquisition")
+        })
+    };
+    let second_task = {
+        let barrier = barrier.clone();
+        tokio::spawn(async move {
+            barrier.wait().await;
+            second
+                .acquire_foreground_lease("owner-b", Duration::from_secs(5))
+                .await
+                .expect("second acquisition")
+        })
+    };
+    barrier.wait().await;
+    let first_won = first_task.await.expect("first task");
+    let second_won = second_task.await.expect("second task");
+    assert_ne!(first_won, second_won);
+}
+
+#[tokio::test]
+async fn hard_kill_foreground_process_allows_sleep_after_lease_expiry() {
+    const DB_ENV: &str = "HEKATE_FOREGROUND_KILL_TEST_DB";
+    const READY_ENV: &str = "HEKATE_FOREGROUND_KILL_TEST_READY";
+
+    if let (Ok(url), Ok(ready_path)) = (std::env::var(DB_ENV), std::env::var(READY_ENV)) {
+        let store = Arc::new(SqliteStore::open(&url).await.expect("child store"));
+        let foreground: Arc<dyn CognitiveModel> = Arc::new(KilledForegroundModel { ready_path });
+        let child_engine = engine(store, foreground, SleepModel::normal().0, unused_calls());
+        let _ = child_engine
+            .handle(message_observation(
+                "new task: killed foreground",
+                "killed-message",
+            ))
+            .await;
+        panic!("blocked child foreground model unexpectedly returned");
+    }
+
+    let url = database_url("hard-kill");
+    let store = Arc::new(SqliteStore::open(&url).await.expect("parent store"));
+    let ready_path = std::env::temp_dir().join(format!("hekate-ready-{}.txt", Uuid::new_v4()));
+    let mut child = Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            "--exact",
+            "hard_kill_foreground_process_allows_sleep_after_lease_expiry",
+            "--nocapture",
+        ])
+        .env(DB_ENV, &url)
+        .env(READY_ENV, &ready_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn foreground child");
+    let ready = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if ready_path.exists() {
+                break true;
+            }
+            if child.try_wait().expect("check child status").is_some() {
+                break false;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap_or(false);
+    if !ready {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("child did not enter the blocked foreground model");
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    child.kill().expect("forcibly kill foreground child");
+    assert!(!child.wait().expect("wait for killed child").success());
+
+    let killed_state = store.state().await.expect("state after process death");
+    assert_eq!(killed_state.observations.len(), 1);
+    assert_eq!(killed_state.attempts.len(), 1);
+    assert!(matches!(
+        killed_state
+            .attempts
+            .values()
+            .next()
+            .expect("started attempt")
+            .status,
+        AttemptStatus::Started
+    ));
+    assert!(store
+        .has_active_foreground_lease()
+        .await
+        .expect("lease remains until expiry"));
+
+    tokio::time::timeout(Duration::from_secs(40), async {
+        while store
+            .has_active_foreground_lease()
+            .await
+            .expect("check expiring lease")
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("lease did not expire after process death");
+
+    let external_calls = unused_calls();
+    let (sleep, sleep_calls) = SleepModel::normal();
+    let sleep_engine = engine(
+        store.clone(),
+        ForegroundModel::normal().0,
+        sleep,
+        external_calls.clone(),
+    );
+    let slept = sleep_engine
+        .sleep_once()
+        .await
+        .expect("sleep after lease expiry");
+    assert!(matches!(slept.status, SleepOnceStatus::Completed));
+    assert!(slept.cursor_after.is_some());
+    assert_eq!(sleep_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(external_calls.load(Ordering::SeqCst), 0);
+
+    let state = store.state().await.expect("state after sleep");
+    assert!(state.operations.is_empty());
+    let replay = sleep_engine
+        .recovery_report()
+        .await
+        .expect("replay after sleep");
+    assert!(replay.projection_verified);
+    assert_eq!(replay.incomplete_attempts.len(), 1);
+    let _ = fs::remove_file(ready_path);
 }
 
 #[tokio::test]

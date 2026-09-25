@@ -1,4 +1,17 @@
-use crate::core::{CurrentState, Focus, Observation, RunStatus};
+use crate::core::{CurrentState, Focus, Observation, RunId, RunStatus};
+
+pub fn focus_for_run(state: &CurrentState, run_id: RunId) -> Option<Focus> {
+    let run = state.runs.get(&run_id)?;
+    let task_id = run.task_id;
+    let goal_id = task_id
+        .and_then(|id| state.tasks.get(&id))
+        .and_then(|task| task.goal_id);
+    Some(Focus {
+        goal_id,
+        task_id,
+        run_id: Some(run.id),
+    })
+}
 
 pub fn resolve_focus(state: &CurrentState, observation: &Observation) -> Focus {
     let content = observation.content.trim().to_ascii_lowercase();
@@ -20,16 +33,6 @@ pub fn resolve_focus(state: &CurrentState, observation: &Observation) -> Focus {
             )
         })
         .max_by_key(|run| run.started_at.clone())
-        .map(|run| {
-            let task_id = run.task_id;
-            let goal_id = task_id
-                .and_then(|id| state.tasks.get(&id))
-                .and_then(|task| task.goal_id);
-            Focus {
-                goal_id,
-                task_id,
-                run_id: Some(run.id),
-            }
-        })
+        .and_then(|run| focus_for_run(state, run.id))
         .unwrap_or_else(Focus::unattached)
 }

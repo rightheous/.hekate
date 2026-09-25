@@ -254,30 +254,18 @@ impl Storage for SqliteStore {
     ) -> Result<bool, StorageError> {
         let now = unix_time_ms();
         let expires = lease_deadline(now, ttl);
-        let mut transaction = self
-            .database
-            .pool()
-            .begin()
-            .await
-            .map_err(|error| StorageError::Backend(error.to_string()))?;
-        sqlx::query("DELETE FROM foreground_leases WHERE expires_at_ms <= ?")
-            .bind(now)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|error| StorageError::Backend(error.to_string()))?;
         let result = sqlx::query(
-            "INSERT INTO foreground_leases (owner_id, expires_at_ms) VALUES (?, ?) \
-             ON CONFLICT(owner_id) DO NOTHING",
+            "INSERT INTO foreground_lease (slot, owner_id, expires_at_ms) VALUES (1, ?, ?) \
+             ON CONFLICT(slot) DO UPDATE SET owner_id = excluded.owner_id, \
+             expires_at_ms = excluded.expires_at_ms \
+             WHERE foreground_lease.expires_at_ms <= ?",
         )
         .bind(owner)
         .bind(expires)
-        .execute(&mut *transaction)
+        .bind(now)
+        .execute(self.database.pool())
         .await
         .map_err(|error| StorageError::Backend(error.to_string()))?;
-        transaction
-            .commit()
-            .await
-            .map_err(|error| StorageError::Backend(error.to_string()))?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -288,8 +276,8 @@ impl Storage for SqliteStore {
     ) -> Result<bool, StorageError> {
         let now = unix_time_ms();
         let result = sqlx::query(
-            "UPDATE foreground_leases SET expires_at_ms = ? \
-             WHERE owner_id = ? AND expires_at_ms > ?",
+            "UPDATE foreground_lease SET expires_at_ms = ? \
+             WHERE slot = 1 AND owner_id = ? AND expires_at_ms > ?",
         )
         .bind(lease_deadline(now, ttl))
         .bind(owner)
@@ -301,7 +289,7 @@ impl Storage for SqliteStore {
     }
 
     async fn release_foreground_lease(&self, owner: &str) -> Result<(), StorageError> {
-        sqlx::query("DELETE FROM foreground_leases WHERE owner_id = ?")
+        sqlx::query("DELETE FROM foreground_lease WHERE slot = 1 AND owner_id = ?")
             .bind(owner)
             .execute(self.database.pool())
             .await
@@ -311,7 +299,7 @@ impl Storage for SqliteStore {
 
     async fn has_active_foreground_lease(&self) -> Result<bool, StorageError> {
         let row = sqlx::query(
-            "SELECT EXISTS(SELECT 1 FROM foreground_leases WHERE expires_at_ms > ?) AS active",
+            "SELECT EXISTS(SELECT 1 FROM foreground_lease WHERE slot = 1 AND expires_at_ms > ?) AS active",
         )
         .bind(unix_time_ms())
         .fetch_one(self.database.pool())

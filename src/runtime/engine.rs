@@ -34,7 +34,7 @@ use crate::runtime::context_builder::{build_context_snapshot, ContextBuilderErro
 use crate::runtime::deliberation::{
     decision_from_cycle, validate_judgment, JudgmentValidationError,
 };
-use crate::runtime::focus::resolve_focus;
+use crate::runtime::focus::{focus_for_run, resolve_focus};
 use crate::runtime::memory_integration::{
     IntegrationCandidateInspection, IntegrationError, MemoryIntegration, MemoryIntegrationResult,
     PositionIntegrationResult,
@@ -268,6 +268,15 @@ impl Engine {
             .cloned()
         {
             let events = self.storage.load_events().await?;
+            let existing_run = events
+                .iter()
+                .find(|event| {
+                    event.event_kind == EventKind::RunStarted
+                        && event.correlation_id.as_deref() == Some(existing.id.to_string().as_str())
+                })
+                .map(|event| serde_json::from_value::<Run>(event.payload.clone()))
+                .transpose()?;
+            let existing_focus = existing_run.and_then(|run| focus_for_run(&state, run.id));
             let decision: Option<crate::core::Decision> = events
                 .iter()
                 .rev()
@@ -294,7 +303,7 @@ impl Engine {
                 });
                 return Ok(InteractionResult {
                     observation_id: existing.id,
-                    focus: resolve_focus(&state, &existing),
+                    focus: existing_focus.unwrap_or_else(|| resolve_focus(&state, &existing)),
                     decision,
                     revision: state.revision,
                     operation_id,
@@ -326,6 +335,7 @@ impl Engine {
                     state,
                     started_attempt,
                     lease_lost,
+                    existing_focus,
                 )
                 .await;
         }
@@ -348,6 +358,7 @@ impl Engine {
             state,
             started_attempt,
             lease_lost,
+            None,
         )
         .await
     }
@@ -359,6 +370,7 @@ impl Engine {
         mut state: CurrentState,
         started_attempt: &mut Option<Attempt>,
         lease_lost: &mut watch::Receiver<bool>,
+        existing_focus: Option<crate::core::Focus>,
     ) -> Result<InteractionResult, EngineError> {
         let snapshot_events = self.storage.load_events().await?;
         let recall = self
@@ -369,7 +381,7 @@ impl Engine {
                 &snapshot_events,
             )
             .await;
-        let mut focus = resolve_focus(&state, &observation);
+        let mut focus = existing_focus.unwrap_or_else(|| resolve_focus(&state, &observation));
         let relationship_id = state.relationships.values().find_map(|relationship| {
             (relationship.participants.contains(&self.user_id)
                 && relationship.participants.contains(&self.hekate_id))
