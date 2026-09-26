@@ -43,6 +43,13 @@ separate report:
 cargo run --bin model_context_eval -- --run-recall-followup /home/hekate/hekate-evals/<prior-jsonl>
 ```
 
+To continue the same call budget after a follow-up, pass its JSONL path as a second
+argument; cumulative generation counts are carried forward:
+
+```sh
+cargo run --bin model_context_eval -- --run-recall-followup /home/hekate/hekate-evals/<seed-jsonl> /home/hekate/hekate-evals/<prior-followup-jsonl>
+```
+
 ## Settings and wire format
 
 `[model_io]` accepts `transport`, `context_tokens`, `foreground_max_tokens`,

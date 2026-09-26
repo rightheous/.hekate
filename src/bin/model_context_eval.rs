@@ -350,6 +350,28 @@ fn prior_recall_evaluation(
         prior_calls,
     ))
 }
+fn prior_followup_calls(path: &std::path::Path, seed_commit: &str) -> Result<usize> {
+    let mut found = false;
+    let mut calls = 0usize;
+    for line in fs::read_to_string(path)?.lines() {
+        let row: Value = serde_json::from_str(line)?;
+        if row.get("scenario").and_then(Value::as_str)
+            == Some("C_cross_thread_recall_embedding_followup")
+        {
+            if row.get("seed_code_commit").and_then(Value::as_str) != Some(seed_commit) {
+                bail!("follow-up report belongs to a different seed evaluation");
+            }
+            found = true;
+        }
+        if let Some(count) = row.get("generation_calls_total").and_then(Value::as_u64) {
+            calls = calls.max(usize::try_from(count)?);
+        }
+    }
+    if !found {
+        bail!("prior report is not a recall follow-up result");
+    }
+    Ok(calls)
+}
 fn observation(config: &Config, thread: &str, message: &str, content: &str) -> Observation {
     Observation {
         id: hekate::core::ObservationId::new(),
@@ -654,10 +676,20 @@ async fn run_live() -> Result<()> {
     println!("live evaluation complete; JSONL: {}", report.display());
     Ok(())
 }
-async fn run_recall_followup(prior_report: &std::path::Path) -> Result<()> {
+async fn run_recall_followup(
+    prior_report: &std::path::Path,
+    prior_followup: Option<&std::path::Path>,
+) -> Result<()> {
     let commit = commit()?;
-    let (seed_commit, database, workspace, expected_source, prior_calls) =
+    let (seed_commit, database, workspace, expected_source, seed_calls) =
         prior_recall_evaluation(prior_report)?;
+    let prior_calls = match prior_followup {
+        Some(path) => prior_followup_calls(path, &seed_commit)?.max(seed_calls),
+        None => seed_calls,
+    };
+    if prior_calls.saturating_add(2) > MAX_GENERATION_CALLS {
+        bail!("prior evaluations leave fewer than two bounded generation calls");
+    }
     let nonce = format!(
         "{}-{}",
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
@@ -713,7 +745,7 @@ async fn run_recall_followup(prior_report: &std::path::Path) -> Result<()> {
     }) {
         jsonl(
             &mut file,
-            json!({"code_commit":commit,"seed_code_commit":seed_commit,"scenario":"embedding_index","outcome":"expected_source_missing","error_kind":"source_event_missing","expected_recall_source_event_id":expected_source,"report":report,"prior_report":prior_report}),
+            json!({"code_commit":commit,"seed_code_commit":seed_commit,"scenario":"embedding_index","outcome":"expected_source_missing","error_kind":"source_event_missing","expected_recall_source_event_id":expected_source,"report":report,"prior_report":prior_report,"prior_followup_report":prior_followup}),
         )?;
         println!("recall source missing; JSONL: {}", report.display());
         return Ok(());
@@ -723,7 +755,7 @@ async fn run_recall_followup(prior_report: &std::path::Path) -> Result<()> {
         Err(_) => {
             jsonl(
                 &mut file,
-                json!({"code_commit":commit,"seed_code_commit":seed_commit,"scenario":"embedding_index","outcome":"embedding_index_failed","error_kind":"embedding_provider_error","expected_recall_source_event_id":expected_source,"report":report,"prior_report":prior_report}),
+                json!({"code_commit":commit,"seed_code_commit":seed_commit,"scenario":"embedding_index","outcome":"embedding_index_failed","error_kind":"embedding_provider_error","expected_recall_source_event_id":expected_source,"report":report,"prior_report":prior_report,"prior_followup_report":prior_followup}),
             )?;
             println!("embedding index failed; JSONL: {}", report.display());
             return Ok(());
@@ -731,7 +763,7 @@ async fn run_recall_followup(prior_report: &std::path::Path) -> Result<()> {
     };
     jsonl(
         &mut file,
-        json!({"code_commit":commit,"seed_code_commit":seed_commit,"scenario":"embedding_index","transport":"existing_local_embedding_endpoint","embedding_model":config.embedding_model,"discovered":index_report.discovered,"embedded":index_report.embedded,"skipped":index_report.skipped,"expected_recall_source_event_id":expected_source,"report":report,"prior_report":prior_report}),
+        json!({"code_commit":commit,"seed_code_commit":seed_commit,"scenario":"embedding_index","transport":"existing_local_embedding_endpoint","embedding_model":config.embedding_model,"discovered":index_report.discovered,"embedded":index_report.embedded,"skipped":index_report.skipped,"expected_recall_source_event_id":expected_source,"report":report,"prior_report":prior_report,"prior_followup_report":prior_followup}),
     )?;
 
     let calls = Arc::new(AtomicUsize::new(0));
@@ -789,6 +821,7 @@ async fn run_recall_followup(prior_report: &std::path::Path) -> Result<()> {
     );
     row["seed_code_commit"] = json!(seed_commit);
     row["prior_report"] = json!(prior_report);
+    row["prior_followup_report"] = json!(prior_followup);
     row["generation_calls_prior_evaluation"] = json!(prior_calls);
     row["generation_calls_this_followup"] = json!(model_calls);
     row["generation_calls_total"] = json!(prior_calls + model_calls);
@@ -807,7 +840,14 @@ async fn run() -> Result<()> {
     match args.as_slice() {
         [arg] if arg == "--run-live-evaluation" => run_live().await,
         [arg, path] if arg == "--run-recall-followup" => {
-            run_recall_followup(std::path::Path::new(path)).await
+            run_recall_followup(std::path::Path::new(path), None).await
+        }
+        [arg, seed, prior] if arg == "--run-recall-followup" => {
+            run_recall_followup(
+                std::path::Path::new(seed),
+                Some(std::path::Path::new(prior)),
+            )
+            .await
         }
         _ => bail!("use --run-live-evaluation or --run-recall-followup <prior-jsonl>"),
     }

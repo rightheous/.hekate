@@ -224,6 +224,44 @@ async fn whole_item_budget_counts_corrections_and_never_sends_overflow() {
     );
 }
 
+#[test]
+fn request_budget_keeps_high_score_recall_before_unrelated_recent_history() {
+    let mut context = context();
+    let recalled = EventId::new();
+    let unrelated = EventId::new();
+    context.recall.items.push(RecalledItem {
+        entity: EntityRef::new(EntityKind::Observation, uuid::Uuid::new_v4()),
+        source_event_id: recalled,
+        source_hash: "private-source-hash".into(),
+        as_of_sequence: 1,
+        text: "달빛-만년필-7391".into(),
+        score: 0.95,
+        created_at: now(),
+    });
+    context.context_snapshot = Some(json!({
+        "anchors": [],
+        "active_recent": [
+            ContextItem { kind: ContextItemKind::Recall, text: "달빛-만년필-7391".into(),
+                source_event_ids: vec![recalled], entity: None, as_of_revision: 1 },
+            ContextItem { kind: ContextItemKind::RecentObservation,
+                text: "older unrelated history ".repeat(2500), source_event_ids: vec![unrelated],
+                entity: None, as_of_revision: 1 }
+        ],
+        "compressed_middle": []
+    }));
+    let request = PrimaryModel::from_config(&config("http://127.0.0.1:9/v1".into()))
+        .unwrap()
+        .prepare_foreground(&context, None)
+        .unwrap();
+    assert!(request.evidence_ids.contains(&recalled));
+    assert!(!request.evidence_ids.contains(&unrelated));
+    assert!(request.messages[1].content.contains("달빛-만년필-7391"));
+    assert!(!request.messages[1]
+        .content
+        .contains("older unrelated history"));
+    assert!(!request.messages[1].content.contains("private-source-hash"));
+}
+
 #[tokio::test]
 async fn excluded_evidence_is_rejected_on_both_attempts() {
     let mut context = context();

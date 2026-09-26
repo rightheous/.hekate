@@ -1,7 +1,9 @@
 use crate::core::{
-    model_io::*, ContextItem, ContextItemKind, EntityKind, EventId, SleepContext, ThoughtContext,
+    model_io::*, ContextItem, ContextItemKind, EntityKind, EventId, RecalledItem, SleepContext,
+    ThoughtContext,
 };
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 
 // The wire schema stays flat and the parser still enforces all three phases.
 pub const FOREGROUND_SYSTEM: &str = r#"You are HEKATE. Deliberate in draft, review, then judgment. Return only one flat JSON object, no tools or markdown. Give a concise, substantive answer in the user's language. Never replace judgment phases with placeholders.
@@ -19,6 +21,13 @@ fn item(item: &ContextItem) -> PromptItem {
         value: json!({"kind": item.kind, "text": item.text,
         "source_event_ids": item.source_event_ids, "entity": item.entity}),
         evidence_ids: item.source_event_ids.clone(),
+    }
+}
+fn recall_item(item: &RecalledItem) -> PromptItem {
+    PromptItem {
+        value: json!({"kind": ContextItemKind::Recall, "text": item.text,
+            "source_event_ids": [item.source_event_id], "entity": item.entity}),
+        evidence_ids: vec![item.source_event_id],
     }
 }
 
@@ -88,31 +97,74 @@ pub fn foreground(context: &ThoughtContext) -> Result<RenderedPrompt, Preparatio
             required["response_profile"] = profile;
         }
         let active = read("active_recent")?;
-        // Match snapshot hard-limit eviction: recall last, middle next,
-        // oldest recent first. Budget selection drops from the end.
+        let snapshot_recalls = active
+            .iter()
+            .filter(|i| i.kind == ContextItemKind::Recall)
+            .flat_map(|i| i.source_event_ids.iter().copied())
+            .collect::<BTreeSet<_>>();
+        let mut recalls = context
+            .recall
+            .items
+            .iter()
+            .filter(|i| snapshot_recalls.contains(&i.source_event_id))
+            .collect::<Vec<_>>();
+        recalls.sort_by(|a, b| b.score.total_cmp(&a.score));
+        let selected_recalls = recalls
+            .iter()
+            .map(|i| i.source_event_id)
+            .collect::<BTreeSet<_>>();
+        // Keep high-score recalls when the tighter model budget removes context.
+        optional.extend(recalls.into_iter().map(recall_item));
         optional.extend(
             active
                 .iter()
                 .rev()
-                .filter(|i| i.kind != ContextItemKind::Recall)
+                .filter(|i| {
+                    i.kind != ContextItemKind::Recall
+                        && !i
+                            .source_event_ids
+                            .iter()
+                            .any(|id| selected_recalls.contains(id))
+                })
                 .map(item),
         );
-        optional.extend(read("compressed_middle")?.iter().map(item));
         optional.extend(
             active
                 .iter()
-                .filter(|i| i.kind == ContextItemKind::Recall)
+                .filter(|i| {
+                    i.kind == ContextItemKind::Recall
+                        && !i
+                            .source_event_ids
+                            .iter()
+                            .any(|id| selected_recalls.contains(id))
+                })
                 .map(item),
         );
+        optional.extend(read("compressed_middle")?.iter().map(item));
     } else {
-        optional.extend(context.relevant_events.iter().rev().filter(|e| !e.subject.as_ref().is_some_and(|s| s.kind == EntityKind::Observation && s.id == context.observation.id.uuid())).map(|e| PromptItem {
-            value: json!({"source_event_id": e.event_id, "kind": e.event_kind, "data": e.payload}),
-            evidence_ids: vec![e.event_id],
-        }));
-        optional.extend(context.recall.items.iter().map(|i| PromptItem {
-            value: json!({"source_event_id": i.source_event_id, "entity": i.entity, "text": i.text}),
-            evidence_ids: vec![i.source_event_id],
-        }));
+        let mut recalls = context.recall.items.iter().collect::<Vec<_>>();
+        recalls.sort_by(|a, b| b.score.total_cmp(&a.score));
+        let recall_ids = recalls
+            .iter()
+            .map(|i| i.source_event_id)
+            .collect::<BTreeSet<_>>();
+        optional.extend(recalls.into_iter().map(recall_item));
+        optional.extend(
+            context
+                .relevant_events
+                .iter()
+                .rev()
+                .filter(|e| {
+                    !e.subject.as_ref().is_some_and(|s| {
+                        s.kind == EntityKind::Observation
+                            && s.id == context.observation.id.uuid()
+                    }) && !recall_ids.contains(&e.event_id)
+                })
+                .map(|e| PromptItem {
+                    value: json!({"source_event_id": e.event_id, "kind": e.event_kind, "data": e.payload}),
+                    evidence_ids: vec![e.event_id],
+                }),
+        );
     }
     // Cite the current observation's Event ID only when it is present in the ledger.
     if let Some(event_id) = context.current_observation_event_id {
