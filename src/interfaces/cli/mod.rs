@@ -26,6 +26,11 @@ mod repl;
 #[derive(Debug, Parser)]
 #[command(name = "hekate", about = "HEKATE continuity runtime")]
 pub struct Cli {
+    /// Inspect a serialized ThoughtContext (or SleepContext) without HTTP or DB access.
+    #[arg(long, value_name = "CONTEXT_JSON")]
+    pub model_dry_run: Option<PathBuf>,
+    #[arg(long, default_value = "foreground", value_parser = ["foreground", "sleep"])]
+    pub model_purpose: String,
     #[arg(long)]
     pub config: Option<PathBuf>,
     #[arg(long)]
@@ -142,6 +147,27 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     }
     if let Some(workspace_root) = cli.workspace_root.clone() {
         config.workspace_root = workspace_root;
+    }
+    if let Some(path) = &cli.model_dry_run {
+        let bytes = std::fs::read(path)?;
+        let model = crate::adapters::primary_model::PrimaryModel::from_config(&config)
+            .map_err(anyhow::Error::msg)?;
+        let request = if cli.model_purpose == "sleep" {
+            model.prepare_sleep(&serde_json::from_slice(&bytes)?, None)?
+        } else {
+            model.prepare_foreground(&serde_json::from_slice(&bytes)?, None)?
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "transport": config.model_io.transport, "purpose": request.purpose,
+                "budget": request.budget, "message_count": request.messages.len(),
+                "evidence_ids": request.evidence_ids, "position_ids": request.position_ids,
+                "conflict_ids": request.conflict_ids, "context_revision": request.context_revision,
+                "context_hash": request.context_hash,
+            }))?
+        );
+        return Ok(());
     }
     if cli.response_profile {
         validate_response_profile_args(&cli)?;

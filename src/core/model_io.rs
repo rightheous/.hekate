@@ -116,3 +116,52 @@ pub enum PreparationError {
     #[error("context_budget_exceeded: estimated input {0:?}")]
     Budget(BudgetReport),
 }
+
+impl ModelIoConfig {
+    pub fn load_env(&mut self) -> Result<(), crate::config::ConfigError> {
+        // A single JSON value parser handles integers, enum names and typed think.
+        fn value<T: serde::de::DeserializeOwned>(
+            key: &str,
+        ) -> Result<Option<T>, crate::config::ConfigError> {
+            let Ok(raw) = std::env::var(key) else {
+                return Ok(None);
+            };
+            let parsed = serde_json::from_str(&raw)
+                .or_else(|_| serde_json::from_value(serde_json::Value::String(raw.clone())));
+            parsed
+                .map(Some)
+                .map_err(|_| crate::config::ConfigError::InvalidEnvironment {
+                    name: key.into(),
+                    value: "invalid model setting".into(),
+                })
+        }
+        if let Some(v) = value("HEKATE_MODEL_TRANSPORT")? {
+            self.transport = v;
+        }
+        if let Some(v) = value("HEKATE_MODEL_CONTEXT_TOKENS")? {
+            self.context_tokens = Some(v);
+        }
+        if let Some(v) = value("HEKATE_MODEL_FOREGROUND_MAX_TOKENS")? {
+            self.foreground_max_tokens = v;
+        }
+        if let Some(v) = value("HEKATE_MODEL_SLEEP_MAX_TOKENS")? {
+            self.sleep_max_tokens = v;
+        }
+        if let Some(v) = value("HEKATE_MODEL_SAFETY_MARGIN")? {
+            self.safety_margin = v;
+        }
+        if let Some(v) = value("HEKATE_MODEL_FOREGROUND_REASONING_EFFORT")? {
+            self.foreground_reasoning_effort = v;
+        }
+        if let Some(v) = value("HEKATE_MODEL_SLEEP_REASONING_EFFORT")? {
+            self.sleep_reasoning_effort = v;
+        }
+        if let Some(v) = value("HEKATE_MODEL_FOREGROUND_THINK")? {
+            self.foreground_think = Some(v);
+        }
+        if let Some(v) = value("HEKATE_MODEL_SLEEP_THINK")? {
+            self.sleep_think = Some(v);
+        }
+        Ok(())
+    }
+}

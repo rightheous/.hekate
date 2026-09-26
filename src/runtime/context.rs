@@ -124,7 +124,7 @@ pub fn build_context_with_recall_and_snapshot(
         .iter()
         .map(|event| event.event_id)
         .collect::<Vec<_>>();
-    if let Some(event_id) = events.iter().find_map(|event| {
+    let current_observation_event_id = events.iter().find_map(|event| {
         event
             .subject
             .as_ref()
@@ -133,7 +133,8 @@ pub fn build_context_with_recall_and_snapshot(
                     && subject.id == observation.id.uuid()
             })
             .map(|_| event.event_id)
-    }) {
+    });
+    if let Some(event_id) = current_observation_event_id {
         if !recent_event_ids.contains(&event_id) {
             recent_event_ids.push(event_id);
         }
@@ -141,6 +142,7 @@ pub fn build_context_with_recall_and_snapshot(
     let mut snapshot = ThoughtContext {
         event_sequence: state.revision,
         observation: observation.clone(),
+        current_observation_event_id,
         focus: focus.clone(),
         identity: state.hekate_identity().cloned(),
         relationship: relationship.cloned(),

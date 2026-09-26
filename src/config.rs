@@ -8,6 +8,8 @@ use crate::core::PrincipalId;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Config {
+    #[serde(default)]
+    pub model_io: crate::core::model_io::ModelIoConfig,
     #[serde(default = "default_database_url")]
     pub database_url: String,
     #[serde(default = "default_workspace_root")]
@@ -59,6 +61,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            model_io: Default::default(),
             database_url: default_database_url(),
             workspace_root: default_workspace_root(),
             hekate_principal_id: default_hekate_id(),
@@ -220,6 +223,7 @@ impl Config {
                     value,
                 })?;
         }
+        config.model_io.load_env()?;
         config.validate()?;
         Ok(config)
     }

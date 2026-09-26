@@ -141,6 +141,7 @@ fn empty_trace() -> CognitiveTrace {
         draft: None,
         review: None,
         commitment: None,
+        model_io: Vec::new(),
         parse_errors: Vec::new(),
         retries: 0,
         elapsed_ms: 0,

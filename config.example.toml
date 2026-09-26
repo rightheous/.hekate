@@ -3,6 +3,15 @@ workspace_root = "."
 model_base_url = "http://127.0.0.1:19191/v1"
 model_name = "orcarouter/Qwen3.8-27B-Uncensored:iq4_xs"
 model_timeout_seconds = 300
+
+# Deployment limit, not the theoretical maximum advertised by the model.
+[model_io]
+transport = "ollama"
+context_tokens = 8192
+foreground_max_tokens = 2048
+sleep_max_tokens = 2048
+safety_margin = 512
+# Leave think unset unless /api/show advertises an exact supported value.
 docling_binary = "/home/hekate/.local/bin/docling-rs"
 document_timeout_seconds = 120
 # Optional trusted CDP endpoint. Without one, browser operations are unavailable.

@@ -169,6 +169,7 @@ impl CognitiveModel for RecordingModel {
             draft: None,
             review: None,
             commitment: Some(commitment.clone()),
+            model_io: Vec::new(),
             parse_errors: Vec::new(),
             retries: 0,
             elapsed_ms: 0,

@@ -71,7 +71,10 @@ impl SleepCognitiveError {
         }
     }
 
-    pub fn kind(&self) -> &'static str {
+    pub fn kind(&self) -> &str {
+        if let Some(kind) = self.trace().error_kind.as_deref() {
+            return kind;
+        }
         match self {
             Self::Configuration { .. } => "configuration",
             Self::Timeout { .. } => "timeout",

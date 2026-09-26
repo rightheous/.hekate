@@ -623,6 +623,8 @@ pub struct ThoughtCycle {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CognitiveTrace {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_io: Vec<crate::core::model_io::ModelIoDiagnostic>,
     pub trace_id: String,
     pub outcome: String,
     pub provider: String,
@@ -784,6 +786,8 @@ impl CurrentState {
 pub struct ThoughtContext {
     pub event_sequence: u64,
     pub observation: Observation,
+    #[serde(default)]
+    pub current_observation_event_id: Option<EventId>,
     pub focus: Focus,
     pub identity: Option<IdentityVersion>,
     pub relationship: Option<Relationship>,

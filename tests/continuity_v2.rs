@@ -129,6 +129,7 @@ fn trace(sequence: u64, hash: &str, outcome: &str) -> CognitiveTrace {
         draft: None,
         review: None,
         commitment: None,
+        model_io: Vec::new(),
         parse_errors: Vec::new(),
         retries: 0,
         elapsed_ms: 0,
