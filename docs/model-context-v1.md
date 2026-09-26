@@ -33,6 +33,16 @@ requests, including one correction per foreground scenario and Sleep. Configured
 context is recorded separately from `/api/ps` observed context; unloaded model
 metadata is not treated as observed capacity.
 
+If the lexical cross-thread recall scenario misses its source Event, the bounded
+follow-up mode reuses that report's isolated DB, indexes its existing events through
+the local embedding endpoint, then retries only the recall question. It checks the
+prior and follow-up generation count together against the same limit and writes a
+separate report:
+
+```sh
+cargo run --bin model_context_eval -- --run-recall-followup /home/hekate/hekate-evals/<prior-jsonl>
+```
+
 ## Settings and wire format
 
 `[model_io]` accepts `transport`, `context_tokens`, `foreground_max_tokens`,

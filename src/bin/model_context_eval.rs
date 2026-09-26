@@ -1,7 +1,12 @@
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use hekate::{
-    adapters::{local_policy::LocalPolicy, primary_model::PrimaryModel, sqlite::SqliteStore},
+    adapters::{
+        local_policy::LocalPolicy,
+        primary_model::PrimaryModel,
+        sqlite::{SqliteEmbeddingStore, SqliteStore},
+    },
+    bootstrap::build_embedding_provider,
     config::Config,
     core::{
         model_io::TransportKind, now, CognitiveTrace, DecisionKind, EntityKind, EventId, EventKind,
@@ -11,7 +16,10 @@ use hekate::{
         CapabilityCatalog, CapabilityError, CapabilityResult, CognitiveError, CognitiveModel,
         SleepCognitiveError, SleepCognitiveModel, Storage,
     },
-    runtime::{engine::Engine, recovery::recover, SleepOnceStatus},
+    runtime::{
+        embedding_indexer::EmbeddingIndexer, engine::Engine, recall::SemanticRecall,
+        recovery::recover, SleepOnceStatus,
+    },
 };
 use serde_json::{json, Value};
 use std::{
@@ -262,6 +270,86 @@ fn interaction_row(
         "request_count":trace.map(|t|t.model_io.iter().filter(|d|!d.request_hash.is_empty()).count()).unwrap_or(0),
         "generation_calls_total":calls,"capability_executions_total":capabilities,"ollama_ps":ps_summary(ps,MODEL),"diagnostics":trace.map(diagnostics)})
 }
+fn prior_recall_evaluation(
+    path: &std::path::Path,
+) -> Result<(
+    String,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    EventId,
+    usize,
+)> {
+    let mut seed_commit = None;
+    let mut root = None;
+    let mut database = None;
+    let mut workspace = None;
+    let mut expected_source = None;
+    let mut prior_calls = 0usize;
+    for line in fs::read_to_string(path)?.lines() {
+        let row: Value = serde_json::from_str(line)?;
+        match row.get("scenario").and_then(Value::as_str) {
+            Some("preflight") => {
+                seed_commit = row
+                    .get("code_commit")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                root = row
+                    .get("temp_root")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                database = row
+                    .get("database")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                workspace = row
+                    .get("workspace")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+            }
+            Some("C_cross_thread_recall") => {
+                expected_source = row
+                    .get("expected_recall_source_event_id")
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()?;
+            }
+            _ => {}
+        }
+        if let Some(count) = row.get("generation_calls_total").and_then(Value::as_u64) {
+            prior_calls = prior_calls.max(usize::try_from(count)?);
+        }
+    }
+    let root =
+        std::path::PathBuf::from(root.context("prior report has no temp root")?).canonicalize()?;
+    let database = std::path::PathBuf::from(database.context("prior report has no temp database")?)
+        .canonicalize()?;
+    let workspace = std::path::PathBuf::from(workspace.context("prior report has no workspace")?)
+        .canonicalize()?;
+    let root_name = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    if root.parent() != Some(std::path::Path::new("/tmp"))
+        || !root_name.starts_with("hekate-model-context-v1-")
+        || !database.starts_with(&root)
+        || !workspace.starts_with(&root)
+    {
+        bail!("prior report does not point to the isolated evaluation temp directory");
+    }
+    if !database.is_file() || !workspace.is_dir() {
+        bail!("prior evaluation database or workspace is missing");
+    }
+    if prior_calls.saturating_add(2) > MAX_GENERATION_CALLS {
+        bail!("prior evaluation leaves fewer than two bounded generation calls");
+    }
+    Ok((
+        seed_commit.context("prior report has no seed commit")?,
+        database,
+        workspace,
+        expected_source.context("prior report has no expected recall Event ID")?,
+        prior_calls,
+    ))
+}
 fn observation(config: &Config, thread: &str, message: &str, content: &str) -> Observation {
     Observation {
         id: hekate::core::ObservationId::new(),
@@ -274,10 +362,7 @@ fn observation(config: &Config, thread: &str, message: &str, content: &str) -> O
         received_at: now(),
     }
 }
-async fn run() -> Result<()> {
-    if std::env::args().nth(1).as_deref() != Some("--run-live-evaluation") {
-        bail!("pass --run-live-evaluation to authorize the bounded real-model evaluation");
-    }
+async fn run_live() -> Result<()> {
     let commit = commit()?;
     let nonce = format!(
         "{}-{}",
@@ -568,6 +653,164 @@ async fn run() -> Result<()> {
     }
     println!("live evaluation complete; JSONL: {}", report.display());
     Ok(())
+}
+async fn run_recall_followup(prior_report: &std::path::Path) -> Result<()> {
+    let commit = commit()?;
+    let (seed_commit, database, workspace, expected_source, prior_calls) =
+        prior_recall_evaluation(prior_report)?;
+    let nonce = format!(
+        "{}-{}",
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+        Uuid::new_v4()
+    );
+    let output = std::path::Path::new("/home/hekate/hekate-evals");
+    fs::create_dir_all(output)?;
+    let report = output.join(format!("model-context-v1-recall-{nonce}.jsonl"));
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&report)?;
+    let mut config = Config::load(None)?;
+    config.database_url = format!("sqlite://{}", database.display());
+    config.workspace_root = workspace;
+    config.model_name = MODEL.into();
+    config.model_base_url = "http://127.0.0.1:19191/v1".into();
+    config.model_api_key = None;
+    config.model_timeout_seconds = 300;
+    config.embedding_enabled = true;
+    config.embedding_url = "http://127.0.0.1:19082/v1/embeddings".into();
+    config.embedding_model = "embeddinggemma".into();
+    config.embedding_revision = "embeddinggemma-q4_0-768-v1".into();
+    config.embedding_dimensions = 768;
+    config.model_io.transport = TransportKind::Ollama;
+    config.model_io.context_tokens = Some(8192);
+    config.model_io.foreground_max_tokens = 2048;
+    config.model_io.sleep_max_tokens = 2048;
+    config.model_io.safety_margin = 512;
+    config.model_io.foreground_think = None;
+    config.model_io.sleep_think = None;
+
+    let store = Arc::new(SqliteStore::open(&config.database_url).await?);
+    let _ = recover(store.as_ref()).await?;
+    let Some(provider) = build_embedding_provider(&config)? else {
+        bail!("local embedding provider is disabled");
+    };
+    let embedding_store = Arc::new(SqliteEmbeddingStore::open(&config.database_url).await?);
+    let indexer = Arc::new(EmbeddingIndexer::new(
+        Arc::new(provider),
+        embedding_store,
+        config.embedding_batch_size,
+    ));
+    let state = store.state().await?;
+    let events = store.load_events().await?;
+    if !events.iter().any(|event| {
+        event.event_id == expected_source
+            && event.event_kind == EventKind::ObservationRecorded
+            && event
+                .subject
+                .as_ref()
+                .is_some_and(|s| s.kind == EntityKind::Observation)
+    }) {
+        jsonl(
+            &mut file,
+            json!({"code_commit":commit,"seed_code_commit":seed_commit,"scenario":"embedding_index","outcome":"expected_source_missing","error_kind":"source_event_missing","expected_recall_source_event_id":expected_source,"report":report,"prior_report":prior_report}),
+        )?;
+        println!("recall source missing; JSONL: {}", report.display());
+        return Ok(());
+    }
+    let index_report = match indexer.index_once(&state, &events).await {
+        Ok(report) => report,
+        Err(_) => {
+            jsonl(
+                &mut file,
+                json!({"code_commit":commit,"seed_code_commit":seed_commit,"scenario":"embedding_index","outcome":"embedding_index_failed","error_kind":"embedding_provider_error","expected_recall_source_event_id":expected_source,"report":report,"prior_report":prior_report}),
+            )?;
+            println!("embedding index failed; JSONL: {}", report.display());
+            return Ok(());
+        }
+    };
+    jsonl(
+        &mut file,
+        json!({"code_commit":commit,"seed_code_commit":seed_commit,"scenario":"embedding_index","transport":"existing_local_embedding_endpoint","embedding_model":config.embedding_model,"discovered":index_report.discovered,"embedded":index_report.embedded,"skipped":index_report.skipped,"expected_recall_source_event_id":expected_source,"report":report,"prior_report":prior_report}),
+    )?;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let capabilities = Arc::new(AtomicUsize::new(0));
+    let model = Arc::new(RecordingModel {
+        inner: Arc::new(PrimaryModel::from_config(&config).map_err(anyhow::Error::msg)?),
+        captured: Arc::new(Mutex::new(Captured::default())),
+        calls: calls.clone(),
+    });
+    let engine = Engine::new(
+        store,
+        model.clone(),
+        Arc::new(LocalPolicy),
+        Arc::new(NoCapabilities(capabilities.clone())),
+        config.hekate_principal_id,
+        config.user_principal_id,
+    )
+    .with_semantic_recall(Arc::new(SemanticRecall::new(indexer)))
+    .with_sleep_model(model.clone());
+    let observation = observation(
+        &config,
+        "context-c-embedding-followup",
+        "message-c-embedding-followup",
+        "앞 대화에서 기억해 달라고 한 임시 문구를 말해줘.",
+    );
+    let result = engine.handle(observation).await;
+    let model_calls = calls.load(Ordering::SeqCst);
+    if prior_calls + model_calls > MAX_GENERATION_CALLS {
+        bail!("follow-up exceeded the cumulative generation-call limit");
+    }
+    let client = reqwest::Client::new();
+    let ps = get_api(&client, "http://127.0.0.1:19191", "/api/ps")
+        .await
+        .unwrap_or(Value::Null);
+    let captured = model.captured.lock().unwrap();
+    let index = (!captured.foreground.is_empty()).then_some(captured.foreground.len() - 1);
+    let capture = index.and_then(|i| captured.foreground.get(i));
+    let recall_ok = capture.is_some_and(|c| {
+        c.recall_sources.contains(&expected_source)
+            && c.trace.referenced_event_ids.contains(&expected_source)
+    });
+    let mut row = interaction_row(
+        &commit,
+        "C_cross_thread_recall_embedding_followup",
+        "foreground",
+        &captured,
+        index,
+        result.as_ref().ok(),
+        model_calls,
+        capabilities.load(Ordering::SeqCst),
+        &ps,
+        Some(recall_ok),
+        Some(expected_source),
+        None,
+    );
+    row["seed_code_commit"] = json!(seed_commit);
+    row["prior_report"] = json!(prior_report);
+    row["generation_calls_prior_evaluation"] = json!(prior_calls);
+    row["generation_calls_this_followup"] = json!(model_calls);
+    row["generation_calls_total"] = json!(prior_calls + model_calls);
+    row["cumulative_generation_call_limit"] = json!(MAX_GENERATION_CALLS);
+    row["embedding_documents_discovered"] = json!(index_report.discovered);
+    row["embedding_documents_embedded"] = json!(index_report.embedded);
+    row["embedding_documents_skipped"] = json!(index_report.skipped);
+    row["report"] = json!(report);
+    jsonl(&mut file, row)?;
+    drop(captured);
+    println!("recall follow-up complete; JSONL: {}", report.display());
+    Ok(())
+}
+async fn run() -> Result<()> {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    match args.as_slice() {
+        [arg] if arg == "--run-live-evaluation" => run_live().await,
+        [arg, path] if arg == "--run-recall-followup" => {
+            run_recall_followup(std::path::Path::new(path)).await
+        }
+        _ => bail!("use --run-live-evaluation or --run-recall-followup <prior-jsonl>"),
+    }
 }
 #[tokio::main]
 async fn main() -> Result<()> {
