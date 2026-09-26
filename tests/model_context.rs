@@ -178,6 +178,13 @@ fn request_formats_and_lazy_configuration() {
     let c: Config = toml::from_str("[model_io]\ntransport='ollama'\ncontext_tokens=8192\nforeground_think='low'\nsleep_think=false").unwrap();
     assert_eq!(c.model_io.transport, TransportKind::Ollama);
     assert_eq!(c.model_io.sleep_think, Some(Think::Enabled(false)));
+    let c: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
+    assert_eq!(c.model_io.transport, TransportKind::Ollama);
+    assert_eq!(c.model_io.context_tokens, Some(8192));
+    assert_eq!(
+        c.docling_binary,
+        std::path::Path::new("/home/hekate/.local/bin/docling-rs")
+    );
 }
 
 #[tokio::test]
