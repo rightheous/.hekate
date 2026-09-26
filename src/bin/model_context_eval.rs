@@ -545,7 +545,7 @@ async fn run_live() -> Result<()> {
         None
     };
     let cap = model.captured.lock().unwrap();
-    let idx = (!cap.foreground.is_empty()).then_some(cap.foreground.len() - 1);
+    let idx = cap.foreground.len().checked_sub(1);
     drop(cap);
     let replay = if a_result.is_ok() {
         engine
@@ -589,7 +589,11 @@ async fn run_live() -> Result<()> {
         .await
         .unwrap_or(Value::Null);
     let captured = model.captured.lock().unwrap();
-    let idx = (captured.foreground.len() > before_b).then_some(captured.foreground.len() - 1);
+    let idx = if captured.foreground.len() > before_b {
+        captured.foreground.len().checked_sub(1)
+    } else {
+        None
+    };
     let row = interaction_row(
         &commit,
         "B_independent_judgment",
@@ -622,7 +626,11 @@ async fn run_live() -> Result<()> {
         .await
         .unwrap_or(Value::Null);
     let captured = model.captured.lock().unwrap();
-    let idx = (captured.foreground.len() > before_c).then_some(captured.foreground.len() - 1);
+    let idx = if captured.foreground.len() > before_c {
+        captured.foreground.len().checked_sub(1)
+    } else {
+        None
+    };
     let ccap = idx.and_then(|i| captured.foreground.get(i));
     let source_recalled = event_a.zip(ccap).is_some_and(|(id, c)| {
         c.recall_sources.contains(&id) && c.trace.referenced_event_ids.contains(&id)
@@ -785,8 +793,8 @@ async fn run_recall_followup(
     .with_sleep_model(model.clone());
     let observation = observation(
         &config,
-        "context-c-embedding-followup",
-        "message-c-embedding-followup",
+        &format!("context-c-embedding-followup-{nonce}"),
+        &format!("message-c-embedding-followup-{nonce}"),
         "앞 대화에서 기억해 달라고 한 임시 문구를 말해줘.",
     );
     let result = engine.handle(observation).await;
@@ -799,7 +807,7 @@ async fn run_recall_followup(
         .await
         .unwrap_or(Value::Null);
     let captured = model.captured.lock().unwrap();
-    let index = (!captured.foreground.is_empty()).then_some(captured.foreground.len() - 1);
+    let index = captured.foreground.len().checked_sub(1);
     let capture = index.and_then(|i| captured.foreground.get(i));
     let recall_ok = capture.is_some_and(|c| {
         c.recall_sources.contains(&expected_source)
