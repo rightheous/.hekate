@@ -112,12 +112,35 @@ impl PrimaryModel {
             "model": self.model,
             "temperature": 0,
             "max_tokens": max_tokens,
+            "reasoning_effort": "low",
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user}
+            ]
+        });
+        self.send_prompt(body).await
+    }
+
+    async fn request_sleep_prompt(
+        &self,
+        system: String,
+        user: String,
+        max_tokens: u32,
+    ) -> Result<RawResponse, RequestError> {
+        let body = serde_json::json!({
+            "model": self.model,
+            "temperature": 0,
+            "max_tokens": max_tokens,
             "model_options": {"reasoning_effort": "none"},
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user}
             ]
         });
+        self.send_prompt(body).await
+    }
+
+    async fn send_prompt(&self, body: Value) -> Result<RawResponse, RequestError> {
         let started = Instant::now();
         let mut request = self.client.post(format!(
             "{}/chat/completions",
@@ -324,7 +347,7 @@ impl PrimaryModel {
         let system = format!(
             "{SLEEP_SYSTEM_PROMPT}\nThe only allowed source_event_ids and counterevidence_event_ids are exactly {allowed}. The allowed candidate kinds are {SLEEP_CANDIDATE_KINDS}.\n{correction}\nReturn only one JSON object; do not include markdown fences."
         );
-        self.request_prompt(system, context_json, 4096).await
+        self.request_sleep_prompt(system, context_json, 4096).await
     }
 
     fn sleep_request_error(
@@ -539,8 +562,13 @@ fn response_diagnostic(raw: &str, category: Option<serde_json::error::Category>)
         .and_then(|usage| usage.get("completion_tokens"))
         .and_then(Value::as_u64)
         .map_or_else(|| "unavailable".to_owned(), |tokens| tokens.to_string());
+    let prompt_tokens = value
+        .and_then(|value| value.get("usage"))
+        .and_then(|usage| usage.get("prompt_tokens"))
+        .and_then(Value::as_u64)
+        .map_or_else(|| "unavailable".to_owned(), |tokens| tokens.to_string());
     let mut diagnostic = format!(
-        "json_error={json_error};top_level_fields={};choices_count={choices_count};first_finish_reason={finish_reason};content={};reasoning_content={};completion_tokens={completion_tokens}",
+        "json_error={json_error};top_level_fields={};choices_count={choices_count};first_finish_reason={finish_reason};content={};reasoning_content={};completion_tokens={completion_tokens};prompt_tokens={prompt_tokens}",
         top_level_fields,
         shape(message.and_then(|message| message.get("content"))),
         shape(message.and_then(|message| message.get("reasoning_content"))),
@@ -1509,9 +1537,7 @@ mod tests {
         (format!("http://{address}/v1"), receiver)
     }
 
-    async fn prompt_response(
-        response_body: &str,
-    ) -> (PrimaryModel, Result<RawResponse, RequestError>) {
+    fn test_model(response_body: &str) -> (PrimaryModel, mpsc::Receiver<Value>) {
         let (base_url, requests) = model_server(response_body);
         let model = PrimaryModel {
             client: reqwest::Client::new(),
@@ -1519,6 +1545,13 @@ mod tests {
             api_key: None,
             model: "test-model".to_owned(),
         };
+        (model, requests)
+    }
+
+    async fn prompt_response(
+        response_body: &str,
+    ) -> (PrimaryModel, Result<RawResponse, RequestError>) {
+        let (model, requests) = test_model(response_body);
         let result = model
             .request_prompt(
                 "private-prompt-sentinel".to_owned(),
@@ -1852,6 +1885,7 @@ mod tests {
                     "content=object:1",
                     "reasoning_content=string:26b",
                     "completion_tokens=7",
+                    "prompt_tokens=101",
                 ],
             ),
             (
@@ -1861,6 +1895,7 @@ mod tests {
                     "top_level_fields=[choices,usage]",
                     "choices_count=0",
                     "completion_tokens=3",
+                    "prompt_tokens=44",
                 ],
             ),
             (
@@ -1872,6 +1907,7 @@ mod tests {
                     "content=null:0",
                     "reasoning_content=null:0",
                     "completion_tokens=5",
+                    "prompt_tokens=10",
                 ],
             ),
         ];
@@ -1888,11 +1924,45 @@ mod tests {
                     "private-user-sentinel",
                     "private-output-sentinel",
                     "private-reasoning-sentinel",
-                    "prompt_tokens",
                     "total_tokens",
                 ],
             );
         }
+    }
+
+    #[tokio::test]
+    async fn request_reasoning_effort_is_foreground_only() {
+        let (model, foreground_requests) =
+            test_model(r#"{"choices":[{"message":{"content":"{}"}}]}"#);
+        model
+            .request(&test_context(), None)
+            .await
+            .expect("foreground model request");
+        let foreground = foreground_requests.recv().expect("foreground request body");
+        assert_eq!(foreground["reasoning_effort"], "low");
+        assert!(foreground.get("model_options").is_none());
+        assert_eq!(foreground["max_tokens"], 8192);
+
+        let (model, sleep_requests) = test_model(r#"{"choices":[{"message":{"content":"{}"}}]}"#);
+        let context = SleepContext {
+            sleep_run_id: crate::core::SleepRunId::new(),
+            high_water_revision: 1,
+            seed_observations: Vec::new(),
+            recalled_experiences: Vec::new(),
+            identity: None,
+            active_positions: Vec::new(),
+            active_conflicts: Vec::new(),
+            relationship: None,
+            snapshot_hash: String::new(),
+        };
+        model
+            .request_sleep(&context, None)
+            .await
+            .expect("Sleep model request");
+        let sleep = sleep_requests.recv().expect("Sleep request body");
+        assert!(sleep.get("reasoning_effort").is_none());
+        assert_eq!(sleep["model_options"]["reasoning_effort"], "none");
+        assert_eq!(sleep["max_tokens"], 4096);
     }
 
     #[tokio::test]
