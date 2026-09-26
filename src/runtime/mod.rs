@@ -33,3 +33,5 @@ pub use memory_integration::{
 pub use projector::{ProjectionError, Projector};
 pub use sleep::{SleepOnceResult, SleepOnceStatus, SleepStatus};
 pub use sleep_worker::{SleepService, SleepWorker, SleepWorkerConfig, SleepWorkerError};
+pub mod prompt_budget;
+pub mod prompt_renderer;

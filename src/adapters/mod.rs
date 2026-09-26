@@ -5,5 +5,6 @@ pub mod embedding;
 pub mod git;
 pub mod local_policy;
 pub mod local_workspace;
+pub mod model_transport;
 pub mod primary_model;
 pub mod sqlite;
