@@ -16,6 +16,7 @@ use crate::core::{
 use crate::ports::{SleepCognitiveModel, Storage, StorageError};
 use crate::runtime::projector::{ProjectionError, Projector};
 use crate::runtime::recall::{recall_local, SemanticRecall, BACKGROUND_RECALL_BUDGET};
+use crate::runtime::sleep_batch::{self, SleepBatchError, SleepBatchPlan};
 
 #[derive(Debug, Error)]
 pub enum SleepRuntimeError {
@@ -135,13 +136,103 @@ impl<'a> SleepCoordinator<'a> {
         }
 
         let events = self.storage.load_events().await?;
-        let (run, resumed, state) = if let Some(run) = state
+        let active_run = state
             .sleep_runs
             .values()
             .find(|run| matches!(run.status, SleepRunStatus::Running))
-            .cloned()
-        {
-            (run, true, state)
+            .cloned();
+        let (run, resumed, state, window, built_context) = if let Some(run) = active_run {
+            let window = seed_window_from_run(&events, &run);
+            if window.invalid_count > 0 {
+                tracing::warn!(
+                    invalid_observation_count = window.invalid_count,
+                    error_kind = "corrupt_observation_payload",
+                    "sleep skipped damaged observation payloads"
+                );
+                return self
+                    .fail_run(run, "corrupt_observation_payload", state, None)
+                    .await;
+            }
+            if window.seeds.is_empty() {
+                let kind = run
+                    .error_kind
+                    .as_deref()
+                    .filter(|kind| {
+                        matches!(
+                            *kind,
+                            "sleep_anchors_exceed_model_budget" | "model_configuration"
+                        )
+                    })
+                    .unwrap_or("corrupt_observation_payload");
+                return self
+                    .fail_run(run.clone(), kind, state, run.context_budget_report.clone())
+                    .await;
+            }
+            let Some(model) = self.model else {
+                return self
+                    .fail_run(run, "sleep_model_unavailable", state, None)
+                    .await;
+            };
+            let recalled = self
+                .collect_recall(
+                    run.id,
+                    run.high_water_revision,
+                    &window.seeds,
+                    &run.seed_event_ids,
+                    &events,
+                    &state,
+                )
+                .await;
+            let built = match self.build_context(
+                run.id,
+                run.high_water_revision,
+                &window.seeds,
+                &recalled,
+                &events,
+                &state,
+                window.deferred_seed_count,
+            ) {
+                Ok(context) => context,
+                Err(error) => {
+                    tracing::warn!(error = %error, "sleep context construction failed");
+                    return self
+                        .fail_run(run, "context_build_failed", state, None)
+                        .await;
+                }
+            };
+            let latest = self.storage.load_state().await?;
+            if latest.revision != state.revision
+                || self.storage.has_active_foreground_lease().await?
+            {
+                return self
+                    .interrupt_run(run, latest, Some(built.budget_report))
+                    .await;
+            }
+            match model.check_sleep_budget(&built.context) {
+                Ok(report) => {
+                    let mut built = built;
+                    built.budget_report.model_budget = Some(report);
+                    (run, true, state, window, built)
+                }
+                Err(crate::core::model_io::PreparationError::Budget(report)) => {
+                    let mut built = built;
+                    built.budget_report.model_budget = Some(report);
+                    return self
+                        .fail_run(
+                            run,
+                            "running_sleep_run_exceeds_model_budget",
+                            state,
+                            Some(built.budget_report),
+                        )
+                        .await;
+                }
+                Err(crate::core::model_io::PreparationError::Configuration(message)) => {
+                    tracing::warn!(%message, "Sleep request configuration is invalid");
+                    return self
+                        .fail_run(run, "model_configuration", state, Some(built.budget_report))
+                        .await;
+                }
+            }
         } else {
             let high_water_revision = state.revision;
             let window = seed_window(&events, state.sleep_cursor, high_water_revision);
@@ -159,86 +250,161 @@ impl<'a> SleepCoordinator<'a> {
                     SleepOnceStatus::Idle
                 }));
             }
-            let run = SleepRun {
-                id: SleepRunId::new(),
-                status: SleepRunStatus::Running,
-                high_water_revision,
-                cursor_before: state.sleep_cursor,
-                cursor_after: None,
-                seed_event_ids: window.event_ids,
-                processed_observation_count: window.seeds.len() as u32,
-                created_candidate_count: 0,
-                started_at: now(),
-                finished_at: None,
-                error_kind: (window.invalid_count > 0)
-                    .then_some("skipped_corrupt_observation_payload".to_owned()),
-                context_budget_report: None,
-            };
-            let event = self.sleep_event(
-                self.hekate_id,
-                EventKind::SleepRunStarted,
-                &run,
-                run.id,
-                None,
-            )?;
-            let state = match self
-                .projector
-                .record_batch(&[event], Some(state.revision), None)
-                .await
-            {
-                Ok(state) => state,
-                Err(ProjectionError::StaleContext { .. })
-                | Err(ProjectionError::Storage(StorageError::StaleContext { .. })) => {
-                    if self.storage.has_active_foreground_lease().await? {
-                        return Ok(empty_result(SleepOnceStatus::Deferred));
-                    }
-                    return Err(SleepRuntimeError::Invalid(
-                        "sleep start lost a concurrent state race".to_owned(),
-                    ));
-                }
-                Err(error) => return Err(error.into()),
-            };
-            (run, false, state)
-        };
-
-        let events = self.storage.load_events().await?;
-        let window = seed_window_from_run(&events, &run);
-        if window.invalid_count > 0 {
-            tracing::warn!(
-                invalid_observation_count = window.invalid_count,
-                error_kind = "corrupt_observation_payload",
-                "sleep skipped damaged observation payloads"
-            );
-        }
-        if window.seeds.is_empty() {
-            return self
-                .fail_run(run, "corrupt_observation_payload", state, None)
-                .await;
-        }
-        if self.model.is_none() {
-            return self
-                .fail_run(run, "sleep_model_unavailable", state, None)
-                .await;
-        }
-
-        let built_context = match self
-            .build_context(
-                &run,
-                &window.seeds,
-                &events,
-                &state,
-                window.deferred_seed_count,
-            )
-            .await
-        {
-            Ok(context) => context,
-            Err(error) => {
-                tracing::warn!(error = %error, "sleep context construction failed");
+            let Some(model) = self.model else {
+                let run = make_running_run(
+                    SleepRunId::new(),
+                    state.sleep_cursor,
+                    high_water_revision,
+                    window.event_ids.clone(),
+                    window.seeds.len(),
+                    window.invalid_count,
+                    None,
+                );
+                let mut run = run;
+                run.error_kind = Some("sleep_model_unavailable".to_owned());
+                let Some(state) = self.record_started_run(&run, &state).await? else {
+                    return Ok(empty_result(SleepOnceStatus::Deferred));
+                };
                 return self
-                    .fail_run(run, "context_build_failed", state, None)
+                    .fail_run(run, "sleep_model_unavailable", state, None)
                     .await;
-            }
+            };
+
+            let run_id = SleepRunId::new();
+            let recalled = self
+                .collect_recall(
+                    run_id,
+                    high_water_revision,
+                    &window.seeds,
+                    &window.event_ids,
+                    &events,
+                    &state,
+                )
+                .await;
+            let planned = sleep_batch::plan_new(
+                window.seeds.len(),
+                window.deferred_seed_count,
+                |prefix_len, deferred_count| {
+                    let seeds = &window.seeds[..prefix_len];
+                    self.build_context(
+                        run_id,
+                        high_water_revision,
+                        seeds,
+                        &recalled,
+                        &events,
+                        &state,
+                        deferred_count,
+                    )
+                    .map(|built| SleepBatchPlan {
+                        context: built.context,
+                        context_budget: built.budget_report,
+                    })
+                    .map_err(|error| error.to_string())
+                },
+                |context| model.check_sleep_budget(context),
+            );
+
+            let plan = match planned {
+                Ok(plan) => plan,
+                Err(error) => {
+                    let (attempt, error_kind) = match error {
+                        SleepBatchError::AnchorsExceed(attempt) => {
+                            (attempt, "sleep_anchors_exceed_model_budget")
+                        }
+                        SleepBatchError::ObservationExceeds(attempt) => {
+                            (attempt, "sleep_observation_exceeds_model_budget")
+                        }
+                        SleepBatchError::ModelConfiguration { attempt, message } => {
+                            tracing::warn!(%message, "Sleep request configuration is invalid");
+                            (attempt, "model_configuration")
+                        }
+                        SleepBatchError::NoCandidates => {
+                            return Ok(empty_result(SleepOnceStatus::Idle));
+                        }
+                        SleepBatchError::ContextBuild(message) => {
+                            tracing::warn!(%message, "sleep context construction failed");
+                            let mut run = make_running_run(
+                                run_id,
+                                state.sleep_cursor,
+                                high_water_revision,
+                                window.event_ids.clone(),
+                                window.seeds.len(),
+                                window.invalid_count,
+                                None,
+                            );
+                            run.error_kind = Some("context_build_failed".to_owned());
+                            let Some(state) = self.record_started_run(&run, &state).await? else {
+                                return Ok(empty_result(SleepOnceStatus::Deferred));
+                            };
+                            return self
+                                .fail_run(run, "context_build_failed", state, None)
+                                .await;
+                        }
+                    };
+                    let context_budget = attempt.context_budget;
+                    let seed_ids = attempt
+                        .context
+                        .seed_observations
+                        .iter()
+                        .map(|seed| seed.event_id)
+                        .collect::<Vec<_>>();
+                    let mut run = make_running_run(
+                        run_id,
+                        state.sleep_cursor,
+                        high_water_revision,
+                        seed_ids,
+                        attempt.context.seed_observations.len(),
+                        window.invalid_count,
+                        Some(context_budget.clone()),
+                    );
+                    run.error_kind = Some(error_kind.to_owned());
+                    let Some(state) = self.record_started_run(&run, &state).await? else {
+                        return Ok(empty_result(SleepOnceStatus::Deferred));
+                    };
+                    return self
+                        .fail_run(run, error_kind, state, Some(context_budget))
+                        .await;
+                }
+            };
+
+            let context_budget = plan.context_budget;
+            let seed_ids = plan
+                .context
+                .seed_observations
+                .iter()
+                .map(|seed| seed.event_id)
+                .collect::<Vec<_>>();
+            let cursor_after = plan
+                .context
+                .seed_observations
+                .last()
+                .map(|seed| seed.sequence);
+            let run = make_running_run(
+                run_id,
+                state.sleep_cursor,
+                high_water_revision,
+                seed_ids,
+                plan.context.seed_observations.len(),
+                window.invalid_count,
+                Some(context_budget.clone()),
+            );
+            let Some(state) = self.record_started_run(&run, &state).await? else {
+                return Ok(empty_result(SleepOnceStatus::Deferred));
+            };
+            let window = SeedWindow {
+                event_ids: run.seed_event_ids.clone(),
+                seeds: plan.context.seed_observations.clone(),
+                cursor_after,
+                invalid_count: window.invalid_count,
+                deferred_seed_count: context_budget.deferred_seed_count,
+            };
+            let built = BuiltSleepContext {
+                context: plan.context,
+                budget_report: context_budget,
+            };
+            (run, false, state, window, built)
         };
+
         let context = built_context.context;
         let budget_report = built_context.budget_report;
         let latest = self.storage.load_state().await?;
@@ -264,8 +430,22 @@ impl<'a> SleepCoordinator<'a> {
                         .interrupt_run(run, latest, Some(budget_report.clone()))
                         .await;
                 }
+                let error_kind =
+                    if error.kind() == "context_budget_exceeded" && error.trace().retries > 0 {
+                        "sleep_correction_context_budget_exceeded"
+                    } else {
+                        error.kind()
+                    };
+                let mut budget_report = budget_report.clone();
+                if error_kind == "sleep_correction_context_budget_exceeded" {
+                    budget_report.model_budget = error
+                        .trace()
+                        .model_io
+                        .last()
+                        .map(|diagnostic| diagnostic.budget.clone());
+                }
                 return self
-                    .fail_run(run, error.kind(), latest, Some(budget_report.clone()))
+                    .fail_run(run, error_kind, latest, Some(budget_report))
                     .await;
             }
         };
@@ -310,7 +490,11 @@ impl<'a> SleepCoordinator<'a> {
         completed.cursor_after = Some(cursor_after);
         completed.created_candidate_count = candidates.len() as u32;
         completed.finished_at = Some(now());
-        completed.error_kind = run.error_kind.clone();
+        completed.error_kind = run
+            .error_kind
+            .as_deref()
+            .filter(|kind| *kind == "skipped_corrupt_observation_payload")
+            .map(str::to_owned);
         completed.context_budget_report = Some(budget_report.clone());
 
         let mut events_to_commit = Vec::with_capacity(candidates.len() + 1);
@@ -360,27 +544,28 @@ impl<'a> SleepCoordinator<'a> {
         ))
     }
 
-    async fn build_context(
+    async fn collect_recall(
         &self,
-        run: &SleepRun,
+        run_id: SleepRunId,
+        high_water_revision: u64,
         seeds: &[SleepSeed],
+        excluded_seed_ids: &[EventId],
         events: &[ExperienceEvent],
         state: &crate::core::CurrentState,
-        deferred_seed_count: usize,
-    ) -> Result<BuiltSleepContext, SleepRuntimeError> {
-        let seed_ids = run.seed_event_ids.clone();
+    ) -> HashMap<EventId, Vec<RecalledItem>> {
         let sequence_by_id = events
             .iter()
             .enumerate()
             .map(|(index, event)| (event.event_id, index as u64 + 1))
             .collect::<HashMap<_, _>>();
-        let mut recalled = HashMap::<EventId, RecalledItem>::new();
+        let excluded = excluded_seed_ids.to_vec();
+        let mut recalled_by_seed = HashMap::new();
         for seed in seeds {
             let query = RecallQuery {
                 text: seed.observation.content.clone(),
                 limit: 6,
-                exclude_event_ids: seed_ids.clone(),
-                as_of_sequence: Some(run.high_water_revision),
+                exclude_event_ids: excluded.clone(),
+                as_of_sequence: Some(high_water_revision),
             };
             let bundle = if let Some(recall) = self.recall {
                 match recall
@@ -390,7 +575,7 @@ impl<'a> SleepCoordinator<'a> {
                     Ok(bundle) => bundle,
                     Err(error) => {
                         tracing::warn!(
-                            sleep_run_id = %run.id,
+                            sleep_run_id = %run_id,
                             error = %error,
                             "sleep semantic recall unavailable; using local recall"
                         );
@@ -400,21 +585,56 @@ impl<'a> SleepCoordinator<'a> {
             } else {
                 recall_local(&query, state, events)
             };
-            for item in bundle.items {
-                if seed_ids.contains(&item.source_event_id)
-                    || sequence_by_id
+            let items = bundle
+                .items
+                .into_iter()
+                .filter(|item| {
+                    !excluded_seed_ids.contains(&item.source_event_id)
+                        && sequence_by_id
+                            .get(&item.source_event_id)
+                            .is_some_and(|sequence| *sequence <= high_water_revision)
+                })
+                .collect::<Vec<_>>();
+            recalled_by_seed.insert(seed.event_id, items);
+        }
+        recalled_by_seed
+    }
+
+    fn build_context(
+        &self,
+        run_id: SleepRunId,
+        high_water_revision: u64,
+        seeds: &[SleepSeed],
+        recalled_by_seed: &HashMap<EventId, Vec<RecalledItem>>,
+        events: &[ExperienceEvent],
+        state: &crate::core::CurrentState,
+        deferred_seed_count: usize,
+    ) -> Result<BuiltSleepContext, SleepRuntimeError> {
+        let seed_ids = seeds.iter().map(|seed| seed.event_id).collect::<Vec<_>>();
+        let sequence_by_id = events
+            .iter()
+            .enumerate()
+            .map(|(index, event)| (event.event_id, index as u64 + 1))
+            .collect::<HashMap<_, _>>();
+        let mut recalled = HashMap::<EventId, RecalledItem>::new();
+        for seed in seeds {
+            if let Some(items) = recalled_by_seed.get(&seed.event_id) {
+                for item in items {
+                    if seed_ids.contains(&item.source_event_id)
+                        || sequence_by_id
+                            .get(&item.source_event_id)
+                            .map(|sequence| *sequence > high_water_revision)
+                            .unwrap_or(true)
+                    {
+                        continue;
+                    }
+                    let replace = recalled
                         .get(&item.source_event_id)
-                        .map(|sequence| *sequence > run.high_water_revision)
-                        .unwrap_or(true)
-                {
-                    continue;
-                }
-                let replace = recalled
-                    .get(&item.source_event_id)
-                    .map(|existing| item.score > existing.score)
-                    .unwrap_or(true);
-                if replace {
-                    recalled.insert(item.source_event_id, item);
+                        .map(|existing| item.score > existing.score)
+                        .unwrap_or(true);
+                    if replace {
+                        recalled.insert(item.source_event_id, item.clone());
+                    }
                 }
             }
         }
@@ -457,7 +677,7 @@ impl<'a> SleepCoordinator<'a> {
             active_positions: active_positions.clone(),
             active_conflicts: active_conflicts.clone(),
             relationship: relationship.clone(),
-            high_water_revision: run.high_water_revision,
+            high_water_revision,
         };
         let anchor_bytes = serialized_len(&anchors)?;
         if anchor_bytes > SLEEP_ANCHOR_BUDGET_BYTES {
@@ -489,8 +709,8 @@ impl<'a> SleepCoordinator<'a> {
         }
 
         let mut context = SleepContext {
-            sleep_run_id: run.id,
-            high_water_revision: run.high_water_revision,
+            sleep_run_id: run_id,
+            high_water_revision,
             seed_observations,
             recalled_experiences,
             identity: anchors.identity,
@@ -523,11 +743,55 @@ impl<'a> SleepCoordinator<'a> {
             included_recall_count: context.recalled_experiences.len(),
             dropped_recall_count,
             hard_limit_bytes: SLEEP_CONTEXT_HARD_LIMIT_BYTES,
+            model_budget: None,
         };
         Ok(BuiltSleepContext {
             context,
             budget_report,
         })
+    }
+
+    async fn record_started_run(
+        &self,
+        run: &SleepRun,
+        state: &crate::core::CurrentState,
+    ) -> Result<Option<crate::core::CurrentState>, SleepRuntimeError> {
+        if self.storage.has_active_foreground_lease().await? {
+            return Ok(None);
+        }
+        if self.storage.load_state().await?.revision != state.revision {
+            if self.storage.has_active_foreground_lease().await? {
+                return Ok(None);
+            }
+            return Err(SleepRuntimeError::Invalid(
+                "sleep start lost a concurrent state race".to_owned(),
+            ));
+        }
+        let event = self.sleep_event(
+            self.hekate_id,
+            EventKind::SleepRunStarted,
+            run,
+            run.id,
+            None,
+        )?;
+        match self
+            .projector
+            .record_batch(&[event], Some(state.revision), None)
+            .await
+        {
+            Ok(state) => Ok(Some(state)),
+            Err(ProjectionError::StaleContext { .. })
+            | Err(ProjectionError::Storage(StorageError::StaleContext { .. })) => {
+                if self.storage.has_active_foreground_lease().await? {
+                    Ok(None)
+                } else {
+                    Err(SleepRuntimeError::Invalid(
+                        "sleep start lost a concurrent state race".to_owned(),
+                    ))
+                }
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     async fn fail_run(
@@ -716,6 +980,31 @@ fn empty_result(status: SleepOnceStatus) -> SleepOnceResult {
     }
 }
 
+fn make_running_run(
+    id: SleepRunId,
+    cursor_before: u64,
+    high_water_revision: u64,
+    seed_event_ids: Vec<EventId>,
+    processed_observation_count: usize,
+    invalid_count: usize,
+    context_budget_report: Option<ContextBudgetReport>,
+) -> SleepRun {
+    SleepRun {
+        id,
+        status: SleepRunStatus::Running,
+        high_water_revision,
+        cursor_before,
+        cursor_after: None,
+        seed_event_ids,
+        processed_observation_count: processed_observation_count as u32,
+        created_candidate_count: 0,
+        started_at: now(),
+        finished_at: None,
+        error_kind: (invalid_count > 0).then_some("skipped_corrupt_observation_payload".to_owned()),
+        context_budget_report,
+    }
+}
+
 fn serialized_len<T: Serialize>(value: &T) -> Result<usize, serde_json::Error> {
     Ok(serde_json::to_vec(value)?.len())
 }
@@ -768,17 +1057,12 @@ fn seed_window(events: &[ExperienceEvent], cursor: u64, high_water_revision: u64
 }
 
 fn seed_window_from_run(events: &[ExperienceEvent], run: &SleepRun) -> SeedWindow {
-    let cursor_after = run
-        .seed_event_ids
-        .iter()
-        .filter_map(|event_id| {
-            events
-                .iter()
-                .enumerate()
-                .find(|(_, event)| event.event_id == *event_id)
-                .map(|(index, _)| index as u64 + 1)
-        })
-        .max();
+    let cursor_after = run.seed_event_ids.last().and_then(|event_id| {
+        events
+            .iter()
+            .position(|event| event.event_id == *event_id)
+            .map(|index| index as u64 + 1)
+    });
     let seeds: Vec<SleepSeed> = run
         .seed_event_ids
         .iter()

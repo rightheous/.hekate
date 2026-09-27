@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::evidence::VerificationDisposition;
+use super::model_io::BudgetReport;
 use super::{
     CognitiveTrace, Conflict, EventId, IdentityVersion, IntegrationCandidateId, Observation,
     Position, Relationship, SleepRunId,
@@ -56,6 +57,8 @@ pub struct ContextBudgetReport {
     pub included_recall_count: usize,
     pub dropped_recall_count: usize,
     pub hard_limit_bytes: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_budget: Option<BudgetReport>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

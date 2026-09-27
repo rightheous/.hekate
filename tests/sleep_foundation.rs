@@ -66,6 +66,14 @@ struct FakeSleepModel {
 
 #[async_trait]
 impl SleepCognitiveModel for FakeSleepModel {
+    fn check_sleep_budget(
+        &self,
+        _: &SleepContext,
+    ) -> Result<hekate::core::model_io::BudgetReport, hekate::core::model_io::PreparationError>
+    {
+        Ok(fake_budget_report())
+    }
+
     async fn deliberate_sleep(
         &self,
         context: &SleepContext,
@@ -148,6 +156,18 @@ fn empty_trace() -> CognitiveTrace {
         raw_response_hash: None,
         error_kind: None,
         created_at: now(),
+    }
+}
+
+fn fake_budget_report() -> hekate::core::model_io::BudgetReport {
+    hekate::core::model_io::BudgetReport {
+        context_tokens: u32::MAX,
+        context_source: "test".to_owned(),
+        estimated_input_tokens: 0,
+        estimation_method: "test".to_owned(),
+        reserved_output_tokens: 1,
+        safety_margin: 0,
+        excluded_items: 0,
     }
 }
 

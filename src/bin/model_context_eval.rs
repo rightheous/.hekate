@@ -108,6 +108,14 @@ impl CognitiveModel for RecordingModel {
 }
 #[async_trait]
 impl SleepCognitiveModel for RecordingModel {
+    fn check_sleep_budget(
+        &self,
+        context: &SleepContext,
+    ) -> Result<hekate::core::model_io::BudgetReport, hekate::core::model_io::PreparationError>
+    {
+        self.inner.check_sleep_budget(context)
+    }
+
     async fn deliberate_sleep(
         &self,
         context: &SleepContext,

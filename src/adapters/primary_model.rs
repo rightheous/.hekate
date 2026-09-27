@@ -362,6 +362,11 @@ impl CognitiveModel for PrimaryModel {
 }
 #[async_trait]
 impl SleepCognitiveModel for PrimaryModel {
+    fn check_sleep_budget(&self, context: &SleepContext) -> Result<BudgetReport, PreparationError> {
+        self.prepare_sleep(context, None)
+            .map(|request| request.budget)
+    }
+
     async fn deliberate_sleep(
         &self,
         context: &SleepContext,
