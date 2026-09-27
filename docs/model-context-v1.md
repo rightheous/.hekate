@@ -8,7 +8,8 @@ the existing strict parser and engine validation.
 ModelIoConfig is a defaulted [model_io] table. Missing context_tokens is an error
 at generation time, not bootstrap. Context metadata maxima are never used as
 deployment limits. The compatibility defaults retain existing output limits; the
-evaluation explicitly sets context/output/output/margin to 8192/2048/2048/512.
+original evaluation explicitly sets context/foreground output/Sleep output/margin
+to 8192/2048/2048/512.
 
 Estimation uses UTF-8 bytes plus message/template overhead. It is an estimate, not
 an exact tokenizer guarantee. Optional items are selected whole, in priority order.
@@ -65,6 +66,41 @@ OpenAI-compatible requests use `/chat/completions`, top-level foreground
 Ollama requests use `/api/chat`, `stream:false`, `options.num_ctx`, and
 `options.num_predict`. Native `think` is emitted only when configured; OpenAI
 reasoning effort is not translated into native `think`.
+
+## Sleep on an 8K Ollama context
+
+The prior Sleep request reserved 2048 generated tokens and ended with
+`done_reason=length` after using all 2048. A bounded follow-up used the same three
+Observation Event IDs. Reducing Sleep prompt metadata lowered the conservative
+input estimate from 5479 to 3424; with a 4096 output reservation and 512 safety
+margin, the request fit at 8032 of 8192 estimated tokens. Ollama then returned
+`stop` with 911 prompt tokens and 1570 completion tokens, and Sleep validation
+completed with two review candidates. Candidate promotion remained disabled.
+
+For an 8K Ollama deployment, the tested per-purpose settings are:
+
+```toml
+[model_io]
+transport = "ollama"
+context_tokens = 8192
+sleep_max_tokens = 4096
+safety_margin = 512
+```
+
+The Sleep `think` setting was omitted because this deployment exposed no
+confirmed level values through `/api/show`. This example describes the tested
+Sleep profile; it does not change the global default. The estimate is tied to
+those three observations and remains conservative rather than tokenizer-exact.
+
+The B/Sleep follow-up evaluator uses fresh databases and Git workspaces and
+allows at most three additional generation calls. It reads the prior Sleep seed
+Event IDs read-only and stores a separate JSONL report:
+
+```sh
+cargo run --bin model_context_eval -- --run-b-sleep-followup \
+  /home/hekate/hekate-evals/<seed-jsonl> \
+  /home/hekate/hekate-evals/<recall-followup-jsonl>
+```
 
 ## Budget and failures
 
