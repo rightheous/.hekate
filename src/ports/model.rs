@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use thiserror::Error;
 
+use crate::core::model_io::{BudgetReport, PreparationError};
 use crate::core::{CognitiveTrace, SleepContext, SleepDeliberation, ThoughtContext, ThoughtCycle};
 
 #[derive(Debug, Error)]
@@ -86,6 +87,13 @@ impl SleepCognitiveError {
 
 #[async_trait]
 pub trait SleepCognitiveModel: Send + Sync {
+    /// Checks the final Sleep request without contacting the model provider.
+    fn check_sleep_budget(&self, _: &SleepContext) -> Result<BudgetReport, PreparationError> {
+        Err(PreparationError::Configuration(
+            "Sleep model does not implement request budget preflight".to_owned(),
+        ))
+    }
+
     async fn deliberate_sleep(
         &self,
         context: &SleepContext,

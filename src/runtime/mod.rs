@@ -15,6 +15,7 @@ pub mod recall;
 pub mod recovery;
 pub mod response_profile;
 pub mod sleep;
+pub mod sleep_batch;
 pub mod sleep_worker;
 
 pub use completion::{
