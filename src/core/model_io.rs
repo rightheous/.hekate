@@ -83,6 +83,12 @@ pub struct ModelIoDiagnostic {
     pub transport: TransportKind,
     pub purpose: RequestPurpose,
     pub budget: BudgetReport,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_ids: Vec<EventId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub position_ids: Vec<PositionId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflict_ids: Vec<ConflictId>,
     pub observed_context_tokens: Option<u32>,
     pub prompt_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,

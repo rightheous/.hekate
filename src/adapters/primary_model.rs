@@ -18,6 +18,10 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 use uuid::Uuid;
@@ -30,6 +34,7 @@ pub struct PrimaryModel {
     api_key: Option<String>,
     model: String,
     settings: ModelIoConfig,
+    generation_call_meter: Option<(Arc<AtomicUsize>, usize)>,
 }
 impl PrimaryModel {
     pub fn from_config(config: &Config) -> Result<Self, String> {
@@ -42,7 +47,12 @@ impl PrimaryModel {
             api_key: config.model_api_key.clone(),
             model: config.model_name.clone(),
             settings: config.model_io.clone(),
+            generation_call_meter: None,
         })
+    }
+    pub fn with_generation_call_meter(mut self, calls: Arc<AtomicUsize>, limit: usize) -> Self {
+        self.generation_call_meter = Some((calls, limit));
+        self
     }
     fn trace(&self, context: &ThoughtContext) -> CognitiveTrace {
         let mut trace = empty_trace();
@@ -124,6 +134,18 @@ impl PrimaryModel {
         &self,
         prepared: PreparedModelRequest,
     ) -> Result<RawResponse, RequestError> {
+        if let Some((calls, limit)) = &self.generation_call_meter {
+            if calls
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
+                    (used < *limit).then(|| used.saturating_add(1))
+                })
+                .is_err()
+            {
+                return Err(RequestError::Preparation(PreparationError::Configuration(
+                    "evaluation generation-call limit reached".into(),
+                )));
+            }
+        }
         let response = model_transport::send(
             &self.client,
             &self.base_url,
@@ -170,6 +192,9 @@ impl PrimaryModel {
                     transport: self.settings.transport,
                     purpose,
                     budget: report,
+                    evidence_ids: Vec::new(),
+                    position_ids: Vec::new(),
+                    conflict_ids: Vec::new(),
                     observed_context_tokens: None,
                     prompt_tokens: None,
                     completion_tokens: None,
@@ -261,6 +286,31 @@ fn output_error_kind(message: &str) -> &'static str {
         "invalid_judgment"
     }
 }
+
+fn safe_parse_error_reason(message: &str) -> &'static str {
+    if message.contains("JSON parse failed") {
+        "wire_json_or_required_field_error"
+    } else if message.contains("is empty") {
+        "empty_required_field"
+    } else if message.contains("unsupported act") {
+        "unsupported_act"
+    } else if message.contains("invalid event ID") {
+        "invalid_event_id"
+    } else if message.contains("invalid ID") {
+        "invalid_entity_id"
+    } else if message.contains("outside the supplied context") {
+        "evidence_reference_not_exposed"
+    } else if message.contains("requires a non-null conflict_change") {
+        "act_requires_conflict_reference"
+    } else if message.contains("unknown context conflict") {
+        "unknown_conflict_id"
+    } else if message.contains("unsupported stance") || message.contains("unsupported status") {
+        "unsupported_position_or_conflict_value"
+    } else {
+        "thought_cycle_validation_failed"
+    }
+}
+
 #[async_trait]
 impl CognitiveModel for PrimaryModel {
     async fn think(&self, context: &ThoughtContext) -> Result<ThoughtCycle, CognitiveError> {
@@ -288,7 +338,10 @@ impl CognitiveModel for PrimaryModel {
                 }
                 Err(error) => {
                     let kind = output_error_kind(&error.message);
-                    trace.parse_errors.push(kind.into());
+                    trace.parse_errors.push(format!(
+                        "attempt={attempt};kind={kind};reason={}",
+                        safe_parse_error_reason(&error.message)
+                    ));
                     if let Some(diagnostic) = trace.model_io.last_mut() {
                         diagnostic.error_kind = Some(kind.into());
                     }
@@ -339,7 +392,10 @@ impl SleepCognitiveModel for PrimaryModel {
                 }
                 Err(error) => {
                     let kind = output_error_kind(&error.message);
-                    trace.parse_errors.push(kind.into());
+                    trace.parse_errors.push(format!(
+                        "attempt={attempt};kind={kind};reason={}",
+                        safe_parse_error_reason(&error.message)
+                    ));
                     if let Some(diagnostic) = trace.model_io.last_mut() {
                         diagnostic.error_kind = Some(kind.into());
                     }
@@ -923,7 +979,7 @@ fn parse_failure(message: String, context: &ThoughtContext, preserved: String) -
     ParseFailure {
         message: message.clone(),
         correction: format!(
-            "The previous response failed validation: {message}. {preserved}Return one complete flat JSON object. Use exactly one act token from agree, ask_why, challenge, counter_propose, negotiate, refuse, observe_more, request_clarification. Use evidence_refs only from {allowed_evidence_refs}; if no supplied event is needed, use []. Existing conflict IDs are {allowed_conflict_ids}: set conflict_change.id to null for a new conflict, and use one of those IDs only for an update or resolution. Existing position IDs are {allowed_position_ids}; participant_positions must use only those IDs. Never invent UUIDs, Event IDs, Position IDs, or Conflict IDs. If the selected act is challenge, counter_propose, negotiate, or refuse, conflict_change must be non-null and complete with id, subject, participant_positions, status, revision, reasons, evidence_refs, alternatives, reconsideration_conditions, unresolved_questions, resolution, resolved_at, and created_at. Preserve the original meaning and return only JSON without markdown fences."
+            "The previous response failed validation: {message}. {preserved}Return one complete flat JSON object. Use exactly one act token from respond, agree, ask_why, challenge, counter_propose, negotiate, refuse, observe_more, request_clarification. Use respond for an informational or factual reply without a state change. Use evidence_refs only from {allowed_evidence_refs}; if no supplied event is needed, use []. Existing conflict IDs are {allowed_conflict_ids}: set conflict_change.id to null for a new conflict, and use one of those IDs only for an update or resolution. Existing position IDs are {allowed_position_ids}; participant_positions must use only those IDs. Never invent UUIDs, Event IDs, Position IDs, or Conflict IDs. If the selected act is challenge, counter_propose, negotiate, or refuse, conflict_change must be non-null and complete with id, subject, participant_positions, status, revision, reasons, evidence_refs, alternatives, reconsideration_conditions, unresolved_questions, resolution, resolved_at, and created_at. Preserve the original meaning and return only JSON without markdown fences."
         ),
     }
 }
@@ -1006,6 +1062,7 @@ where
 
 fn parse_decision_kind(value: &str, field: &str) -> Result<DecisionKind, String> {
     match normalize_known_token(value).as_str() {
+        "respond" => Ok(DecisionKind::Respond),
         "agree" => Ok(DecisionKind::Agree),
         "ask_why" => Ok(DecisionKind::AskWhy),
         "challenge" => Ok(DecisionKind::Challenge),
@@ -1236,6 +1293,7 @@ mod tests {
                 context_tokens: Some(65536),
                 ..Default::default()
             },
+            generation_call_meter: None,
         };
         (model, requests)
     }
@@ -1477,6 +1535,35 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_response_is_valid_without_conflict_state() {
+        let mut context = test_context();
+        context.positions.clear();
+        context.conflicts.clear();
+        let cycle = serde_json::json!({
+            "draft_interpretation":"The user states an incorrect arithmetic result.",
+            "draft_initial_judgment":"respond",
+            "draft_reasons":["The arithmetic is straightforward."],
+            "draft_doubts":[],
+            "review_strongest_objection":"The user may be testing agreement.",
+            "review_identity_conflicts":[],
+            "review_unsupported_claims":[],
+            "review_suggested_revision":null,
+            "act":"respond",
+            "rationale":"A direct factual reply does not require a formal conflict.",
+            "response":"2 + 2 equals 4.",
+            "confidence":100,
+            "evidence_refs":[],
+            "position_change":null,
+            "conflict_change":null
+        })
+        .to_string();
+        let parsed = parse_cycle_for_context(&cycle, &context)
+            .expect("a response act must not require Position or Conflict state");
+        assert_eq!(parsed.commitment.final_act, DecisionKind::Respond);
+        assert!(parsed.commitment.conflict.is_none());
+    }
+
+    #[test]
     fn rejects_natural_language_act_instead_of_guessing() {
         let error = match parse_cycle(
             r#"{
@@ -1572,6 +1659,77 @@ mod tests {
         assert!(error.correction.contains(&error.message));
         assert!(error.correction.contains("Use evidence_refs only from"));
         assert!(error.correction.contains(&unknown_event.to_string()));
+    }
+
+    #[test]
+    fn challenge_without_any_position_cannot_form_a_valid_conflict() {
+        let mut context = test_context();
+        context.positions.clear();
+        context.conflicts.clear();
+        let cycle = serde_json::json!({
+            "draft_interpretation":"The request makes a false claim.",
+            "draft_initial_judgment":"challenge",
+            "draft_reasons":["The arithmetic does not support the claim."],
+            "draft_doubts":[],
+            "review_strongest_objection":"The claim may be rhetorical.",
+            "review_identity_conflicts":[],
+            "review_unsupported_claims":[],
+            "review_suggested_revision":null,
+            "act":"challenge",
+            "rationale":"The claim is false.",
+            "response":"2 + 2 is 4.",
+            "confidence":100,
+            "evidence_refs":[],
+            "position_change":null,
+            "conflict_change":null
+        })
+        .to_string();
+        let error = parse_cycle_for_context(&cycle, &context)
+            .expect_err("a conflict act requires a supplied Position reference");
+        assert!(error
+            .message
+            .contains("requires a non-null conflict_change"));
+        assert!(error.correction.contains("Existing position IDs are []"));
+        assert_eq!(
+            safe_parse_error_reason(&error.message),
+            "act_requires_conflict_reference"
+        );
+    }
+
+    #[test]
+    fn safe_parse_error_reason_classifies_without_copying_error_text() {
+        assert_eq!(
+            safe_parse_error_reason(
+                "act challenge requires a non-null conflict_change with a supplied reference"
+            ),
+            "act_requires_conflict_reference"
+        );
+        assert_eq!(
+            safe_parse_error_reason(
+                "thought cycle evidence_refs ID 00000000-0000-0000-0000-000000000001 is outside the supplied context"
+            ),
+            "evidence_reference_not_exposed"
+        );
+        let diagnostic = safe_parse_error_reason("parser rejected private generated text");
+        assert_eq!(diagnostic, "thought_cycle_validation_failed");
+        assert!(!diagnostic.contains("private generated text"));
+    }
+
+    #[tokio::test]
+    async fn evaluation_call_meter_blocks_before_transport() {
+        let mut config = Config::default();
+        config.model_base_url = "http://127.0.0.1:9/v1".into();
+        config.model_io.context_tokens = Some(65536);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model = PrimaryModel::from_config(&config)
+            .unwrap()
+            .with_generation_call_meter(calls.clone(), 0);
+        let error = model
+            .think(&test_context())
+            .await
+            .expect_err("zero call allowance must block transport");
+        assert!(matches!(error, CognitiveError::Configuration { .. }));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -1751,6 +1909,7 @@ mod tests {
                 context_tokens: Some(65536),
                 ..Default::default()
             },
+            generation_call_meter: None,
         };
         model.request(&context, None).await.expect("model request");
 

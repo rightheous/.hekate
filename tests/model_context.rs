@@ -115,6 +115,9 @@ fn request_formats_and_lazy_configuration() {
     c.model_io.foreground_think = Some(Think::Level("low".into()));
     let model = PrimaryModel::from_config(&c).unwrap();
     let request = model.prepare_foreground(&context, None).unwrap();
+    assert!(request.messages[0].content.contains(
+        "Use respond for a direct informational or factual reply that does not change state."
+    ));
     assert!(request.evidence_ids.contains(&current_event));
     assert!(request.messages[1]
         .content
@@ -131,7 +134,20 @@ fn request_formats_and_lazy_configuration() {
     let sleep = SleepContext {
         sleep_run_id: SleepRunId::new(),
         high_water_revision: 1,
-        seed_observations: vec![],
+        seed_observations: [
+            (1, "사용자는 시작 전에 할 일을 세 항목으로 적었다."),
+            (2, "다음 작업은 한 문장 메모를 읽고 이어서 진행했다."),
+        ]
+        .into_iter()
+        .map(|(sequence, content)| {
+            let event_id = EventId::new();
+            SleepSeed {
+                event_id,
+                sequence,
+                observation: observation(&c, content, &format!("sleep-{sequence}")),
+            }
+        })
+        .collect(),
         recalled_experiences: vec![],
         identity: None,
         active_positions: vec![],
@@ -144,6 +160,27 @@ fn request_formats_and_lazy_configuration() {
     assert_eq!(value["model_options"]["reasoning_effort"], "none");
     assert!(value.get("reasoning_effort").is_none());
     assert!(ollama::body("test", &request).get("think").is_none());
+    let prompt = &request.messages[1].content;
+    for seed in &sleep.seed_observations {
+        assert!(prompt.contains(&seed.event_id.to_string()));
+        assert!(prompt.contains(&seed.observation.content));
+        assert!(!prompt.contains(&seed.observation.id.to_string()));
+        assert!(!prompt.contains(&seed.observation.actor_id.to_string()));
+        assert!(!prompt.contains(&seed.observation.message_id.clone().unwrap()));
+    }
+    let diagnostic = ModelIoDiagnostic::prepared(TransportKind::Ollama, &request);
+    assert_eq!(diagnostic.evidence_ids, request.evidence_ids);
+    assert_eq!(diagnostic.position_ids, request.position_ids);
+    assert_eq!(diagnostic.conflict_ids, request.conflict_ids);
+    c.model_io.sleep_max_tokens = 4096;
+    let request_4096 = PrimaryModel::from_config(&c)
+        .unwrap()
+        .prepare_sleep(&sleep, None)
+        .unwrap();
+    assert_eq!(request_4096.budget.reserved_output_tokens, 4096);
+    assert!(hekate::runtime::prompt_budget::check_prepared(
+        &request_4096
+    ));
     c.model_io.sleep_think = Some(Think::Enabled(false));
     let request = PrimaryModel::from_config(&c)
         .unwrap()
